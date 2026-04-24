@@ -1,0 +1,19 @@
+# ── Secrets – NEVER commit these ──
+.env
+*.env
+
+# ── Python virtual environment ──
+fin_env/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── macOS junk ──
+.DS_Store
+
+# ── Logs ──
+*.log
+logs/

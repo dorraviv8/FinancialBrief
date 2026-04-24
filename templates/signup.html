@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>הרשמה – בריפינג פיננסי בוקר</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+      background: #0d1117;
+      color: #cdd6e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      direction: rtl;
+    }
+    .card {
+      background: #161b27;
+      border: 1px solid #232d42;
+      border-radius: 18px;
+      padding: 44px 40px 36px;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+    }
+    .logo {
+      font-size: 10px;
+      color: #4a6a8a;
+      letter-spacing: 4px;
+      text-transform: uppercase;
+      text-align: center;
+      margin-bottom: 14px;
+    }
+    h1 {
+      color: #f0c040;
+      font-size: 24px;
+      font-weight: 800;
+      text-align: center;
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      color: #7a9ab8;
+      font-size: 13.5px;
+      text-align: center;
+      line-height: 1.7;
+      margin-bottom: 32px;
+    }
+    .accent {
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #f0c040, #e08030, #f0c040, transparent);
+      margin: 0 20px 30px;
+      border-radius: 2px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: #8aaac8;
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+    input[type="text"],
+    input[type="email"] {
+      width: 100%;
+      padding: 12px 16px;
+      background: #0d1117;
+      border: 1px solid #2a3a56;
+      border-radius: 10px;
+      color: #cdd6e0;
+      font-size: 15px;
+      margin-bottom: 20px;
+      outline: none;
+      transition: border-color 0.2s;
+      direction: rtl;
+      text-align: right;
+    }
+    input[type="text"]:focus,
+    input[type="email"]:focus { border-color: #f0c040; }
+    .hp { display: none; }
+    button {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #c8a020, #f0c040);
+      color: #0d1117;
+      font-size: 16px;
+      font-weight: 800;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: opacity 0.2s;
+      margin-top: 4px;
+    }
+    button:hover { opacity: 0.88; }
+    .errors {
+      background: #2a1020;
+      border: 1px solid #6a2030;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      color: #e07080;
+      font-size: 13.5px;
+      line-height: 1.7;
+    }
+    .features {
+      margin-top: 28px;
+      border-top: 1px solid #1e2a3e;
+      padding-top: 22px;
+    }
+    .features p {
+      font-size: 12px;
+      color: #3a5272;
+      text-align: center;
+      margin-bottom: 12px;
+    }
+    .feature-list { display: flex; flex-direction: column; gap: 8px; }
+    .feature {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 12.5px;
+      color: #5a7a9a;
+    }
+    .dot {
+      width: 6px; height: 6px;
+      background: #f0c040;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Financial Intelligence Agent</div>
+    <h1>בריפינג פיננסי בוקר</h1>
+    <p class="subtitle">קבל ניתוח פיננסי מקיף כל בוקר לפני פתיחת המסחר — בעברית, ישירות למייל שלך.</p>
+    <div class="accent"></div>
+
+    {% if errors %}
+    <div class="errors">{% for e in errors %}{{ e }}<br>{% endfor %}</div>
+    {% endif %}
+
+    <form method="POST" action="/signup">
+      <label for="name">שם מלא</label>
+      <input type="text" id="name" name="name" placeholder="ישראל ישראלי" value="{{ name or '' }}" required>
+
+      <label for="email">כתובת מייל</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com" value="{{ email or '' }}" required>
+
+      <!-- Honeypot – hidden from real users, bots fill it -->
+      <div class="hp"><input type="text" name="website" tabindex="-1" autocomplete="off"></div>
+
+      <button type="submit">הרשמה לבריפינג החינמי</button>
+    </form>
+
+    <div class="features">
+      <p>מה תקבל כל בוקר:</p>
+      <div class="feature-list">
+        <div class="feature"><span class="dot"></span>ביצועי SPY, QQQ ושווקים גלובליים</div>
+        <div class="feature"><span class="dot"></span>ניתוח חדשות פיננסיות מרכזיות</div>
+        <div class="feature"><span class="dot"></span>סבב סקטורים ומניות בולטות</div>
+        <div class="feature"><span class="dot"></span>שוק ההון הישראלי ושער הדולר</div>
+        <div class="feature"><span class="dot"></span>מסקנות ומה לעקוב אחריו היום</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

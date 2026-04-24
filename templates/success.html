@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>נרשמת בהצלחה!</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+      background: #0d1117;
+      color: #cdd6e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      direction: rtl;
+    }
+    .card {
+      background: #161b27;
+      border: 1px solid #232d42;
+      border-radius: 18px;
+      padding: 52px 40px 44px;
+      width: 100%;
+      max-width: 460px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+      text-align: center;
+    }
+    .check { font-size: 56px; margin-bottom: 20px; }
+    h1 { color: #f0c040; font-size: 24px; font-weight: 800; margin-bottom: 14px; }
+    .message { color: #7a9ab8; font-size: 15px; line-height: 1.8; margin-bottom: 32px; }
+    .accent {
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #f0c040, #e08030, #f0c040, transparent);
+      margin: 0 40px 32px;
+      border-radius: 2px;
+    }
+    .info {
+      background: #0d1117;
+      border: 1px solid #1e2a3e;
+      border-radius: 10px;
+      padding: 16px 20px;
+      font-size: 13px;
+      color: #5a7a9a;
+      line-height: 1.8;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✅</div>
+    <h1>ברוך הבא, {{ name }}!</h1>
+    <p class="message">נרשמת בהצלחה לבריפינג הפיננסי היומי.<br>תתחיל לקבל את הבריפינג מחר בבוקר.</p>
+    <div class="accent"></div>
+    <div class="info">
+      הבריפינג נשלח כל בוקר לפני פתיחת המסחר האמריקאי.<br>
+      לביטול הרשמה — לחץ על הקישור בתחתית כל מייל.
+    </div>
+  </div>
+</body>
+</html>

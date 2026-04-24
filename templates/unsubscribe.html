@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ביטול הרשמה</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+      background: #0d1117;
+      color: #cdd6e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+      direction: rtl;
+    }
+    .card {
+      background: #161b27;
+      border: 1px solid #232d42;
+      border-radius: 18px;
+      padding: 52px 40px 44px;
+      width: 100%;
+      max-width: 460px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+      text-align: center;
+    }
+    .icon { font-size: 52px; margin-bottom: 20px; }
+    h1 { color: #f0c040; font-size: 22px; font-weight: 800; margin-bottom: 14px; }
+    .message { color: #7a9ab8; font-size: 14.5px; line-height: 1.8; margin-bottom: 28px; }
+    .accent {
+      height: 2px;
+      background: linear-gradient(90deg, transparent, #f0c040, #e08030, #f0c040, transparent);
+      margin: 0 40px 28px;
+      border-radius: 2px;
+    }
+    a { color: #f0c040; font-size: 13px; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    {% if found %}
+      <div class="icon">👋</div>
+      <h1>הסרת הרשמה בוצעה</h1>
+      <p class="message">הוסרת בהצלחה מרשימת התפוצה.<br>לא תקבל יותר את הבריפינג היומי.</p>
+      <div class="accent"></div>
+      <p style="font-size:13px; color:#3a5272;">שינית את דעתך? <a href="/">לחץ כאן להרשמה מחדש</a></p>
+    {% else %}
+      <div class="icon">❓</div>
+      <h1>קישור לא תקין</h1>
+      <p class="message">הקישור אינו תקין או שכבר בוצע ביטול הרשמה בעבר.</p>
+      <div class="accent"></div>
+      <a href="/">חזרה לדף הבית</a>
+    {% endif %}
+  </div>
+</body>
+</html>

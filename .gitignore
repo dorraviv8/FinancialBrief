@@ -14,6 +14,9 @@ __pycache__/
 # ── macOS junk ──
 .DS_Store
 
+# ── Database (contains subscriber emails – never commit) ──
+subscribers.db
+
 # ── Logs ──
 *.log
 logs/

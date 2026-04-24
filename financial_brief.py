@@ -16,8 +16,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from groq import Groq
-import traceback
 import re
+import database
 
 load_dotenv()
 
@@ -28,7 +28,9 @@ FRED_API_KEY      = os.getenv("FRED_API_KEY")
 FINNHUB_KEY       = os.getenv("FINNHUB_KEY")
 GMAIL_USER        = os.getenv("GMAIL_USER")
 GMAIL_APP_PASSWORD= os.getenv("GMAIL_APP_PASSWORD")
-RECIPIENT_EMAIL   = os.getenv("RECIPIENT_EMAIL")
+OWNER_NAME        = os.getenv("OWNER_NAME", "Admin")
+OWNER_EMAIL       = os.getenv("OWNER_EMAIL")
+BASE_URL          = os.getenv("BASE_URL", "http://localhost:5000")
 
 TODAY        = datetime.now().strftime("%d/%m/%Y")
 TODAY_ISO    = datetime.now().strftime("%Y-%m-%d")
@@ -402,7 +404,7 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
 
 
 # ── 12. HTML Email Builder ─────────────────────────────────────────────────────
-def build_html_email(brief_text: str) -> str:
+def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     """Wrap the Hebrew brief in a dark-themed, bubble-card RTL HTML email."""
     day_names = {
         "Monday": "יום שני", "Tuesday": "יום שלישי", "Wednesday": "יום רביעי",
@@ -533,6 +535,8 @@ def build_html_email(brief_text: str) -> str:
     {cards_html}
     <div class="footer">
       נוצר אוטומטית ב-{TODAY} &nbsp;|&nbsp; Yahoo Finance · FRED · Finnhub · Alpha Vantage · RSS<br>
+      <a href="{unsubscribe_url}" style="color:#3a5a7a; font-size:11px;">ביטול הרשמה</a>
+      &nbsp;|&nbsp;
       <span style="color:#2a3d55;">המידע מיועד לצרכי מידע בלבד ואינו מהווה ייעוץ השקעות</span>
     </div>
   </div>
@@ -541,23 +545,28 @@ def build_html_email(brief_text: str) -> str:
 
 
 # ── 13. Send Email ─────────────────────────────────────────────────────────────
-def send_email(html_content: str, subject: str):
-    """Send the HTML email via Gmail SMTP."""
+def send_email(html_content: str, subject: str, recipient_email: str):
+    """Send the HTML email to a single recipient via Gmail SMTP."""
     msg            = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = GMAIL_USER
-    msg["To"]      = RECIPIENT_EMAIL
+    msg["To"]      = recipient_email
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-    print(f"✅ Email sent to {RECIPIENT_EMAIL}")
+        server.sendmail(GMAIL_USER, recipient_email, msg.as_string())
+    print(f"  ✅ Sent to {recipient_email}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     print(f"🚀 Starting Financial Brief Agent – {TODAY}")
+
+    # Ensure DB exists and owner is always subscribed
+    database.init_db()
+    if OWNER_EMAIL:
+        database.seed_owner(OWNER_NAME, OWNER_EMAIL)
 
     print("📈 Collecting US market data...")
     market      = get_market_snapshot()
@@ -576,18 +585,23 @@ def main():
     print("📊 Fetching macro indicators (FRED)...")
     fred = get_fred_indicators()
 
-    print("🤖 Generating Hebrew brief with Gemini AI...")
+    print("🤖 Generating Hebrew brief with Groq AI...")
     brief_text = generate_hebrew_brief(
         market, global_mkts, yields, movers,
         sectors, fear_greed, news, earnings, fred
     )
 
-    print("📧 Building and sending email...")
-    html    = build_html_email(brief_text)
-    subject = f"בריפינג פיננסי בוקר – {TODAY}"
-    send_email(html, subject)
+    print("📧 Sending to all subscribers...")
+    subject     = f"בריפינג פיננסי בוקר – {TODAY}"
+    subscribers = database.get_active_subscribers()
+    print(f"   Found {len(subscribers)} subscriber(s)")
 
-    print("✅ All done!")
+    for sub in subscribers:
+        unsubscribe_url = f"{BASE_URL}/unsubscribe/{sub['token']}"
+        html = build_html_email(brief_text, unsubscribe_url)
+        send_email(html, subject, sub["email"])
+
+    print(f"✅ All done! Sent to {len(subscribers)} subscriber(s)")
 
 
 if __name__ == "__main__":

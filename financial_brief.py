@@ -165,28 +165,30 @@ def get_treasury_yields():
     return results
 
 
-# ── 4. Top Movers (yfinance – S&P100 sample) ──────────────────────────────────
+# ── 4. Top Movers (Yahoo Finance screener – real-time ranked list) ─────────────
 def get_top_movers():
-    """Get biggest gainers and losers from a representative S&P100 sample."""
-    sp100_sample = [
-        "AAPL","MSFT","AMZN","NVDA","GOOGL","META","TSLA","JPM","V","UNH",
-        "XOM","JNJ","WMT","PG","HD","CVX","MRK","LLY","AVGO","COST",
-        "BAC","CSCO","ACN","MCD","ADBE","CRM","TXN","QCOM","IBM","GE"
-    ]
-    movers = []
-    for sym in sp100_sample:
+    """Fetch today's top gainers and losers directly from Yahoo Finance screener."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    base = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    params = {"formatted": "false", "count": "5"}
+
+    def fetch(screen_id):
         try:
-            t = yf.Ticker(sym)
-            hist = t.history(period="2d")
-            if len(hist) >= 2:
-                prev = hist["Close"].iloc[-2]
-                last = hist["Close"].iloc[-1]
-                chg  = ((last - prev) / prev) * 100
-                movers.append({"symbol": sym, "change_pct": round(float(chg), 2), "price": round(float(last), 2)})
+            r = requests.get(base, params={**params, "scrIds": screen_id}, headers=headers, timeout=10)
+            r.raise_for_status()
+            quotes = r.json()["finance"]["result"][0]["quotes"]
+            return [
+                {
+                    "symbol":     q.get("symbol", ""),
+                    "price":      round(float(q.get("regularMarketPrice", 0)), 2),
+                    "change_pct": round(float(q.get("regularMarketChangePercent", 0)), 2),
+                }
+                for q in quotes
+            ]
         except Exception:
-            pass
-    movers.sort(key=lambda x: x["change_pct"], reverse=True)
-    return {"gainers": movers[:5], "losers": movers[-5:][::-1]}
+            return []
+
+    return {"gainers": fetch("day_gainers"), "losers": fetch("day_losers")}
 
 
 # ── 5. Sector Performance (yfinance ETFs) ─────────────────────────────────────

@@ -619,7 +619,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     }}
     /* ── Bubble Cards ── */
     .card {{
-      background: #ffffff;
+      background: #f0f5fc;
       border: 1px solid #c8d8ea;
       border-radius: 14px;
       padding: 22px 26px 20px;

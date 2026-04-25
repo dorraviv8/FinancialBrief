@@ -122,7 +122,7 @@ def get_tase_stocks():
         "בנק הפועלים":  "POLI.TA",
         "בנק לאומי":    "LUMI.TA",
         "מזרחי טפחות":  "MZTF.TA",
-        "רדקום":        "RDCM.TA",
+        "שופרסל":       "SAE.TA",
         "ביג":          "BIG.TA",
     }
     results = {}
@@ -169,11 +169,9 @@ def get_treasury_yields():
 def get_top_movers():
     """Get biggest gainers and losers from a representative S&P100 sample."""
     sp100_sample = [
-        "AAPL","MSFT","AMZN","NVDA","GOOGL","META","TSLA","BRK-B","JPM","V",
-        "UNH","XOM","JNJ","WMT","MA","PG","HD","CVX","MRK","ABBV",
-        "LLY","AVGO","COST","PEP","KO","BAC","TMO","CSCO","ACN","MCD",
-        "ABT","ADBE","CRM","NKE","DHR","TXN","NEE","PM","RTX","AMGN",
-        "QCOM","HON","IBM","GE","CAT","SPGI","LOW","INTU","BLK","AXP"
+        "AAPL","MSFT","AMZN","NVDA","GOOGL","META","TSLA","JPM","V","UNH",
+        "XOM","JNJ","WMT","PG","HD","CVX","MRK","LLY","AVGO","COST",
+        "BAC","CSCO","ACN","MCD","ADBE","CRM","TXN","QCOM","IBM","GE"
     ]
     movers = []
     for sym in sp100_sample:
@@ -279,9 +277,8 @@ def get_news_rss():
             feed = feedparser.parse(url)
             for entry in feed.entries[:3]:
                 title   = entry.get("title", "").strip()
-                summary = entry.get("summary", "")[:120].strip()
                 if title:
-                    all_headlines.append({"source": source, "title": title, "summary": summary})
+                    all_headlines.append({"source": source, "title": title})
         except Exception:
             pass
     return all_headlines[:20]

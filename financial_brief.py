@@ -275,9 +275,10 @@ def get_news_rss():
         ("Globes (גלובס)",      "https://www.globes.co.il/webservice/rss/rssfeeder.asmx/FeederNode?iID=1"),
     ]
     world_feeds = [
-        ("Reuters World",  "https://feeds.reuters.com/Reuters/worldNews"),
-        ("BBC World",      "http://feeds.bbci.co.uk/news/world/rss.xml"),
-        ("AP News",        "https://feeds.apnews.com/apnews/topnews"),
+        ("Reuters World",   "https://feeds.reuters.com/Reuters/worldNews"),
+        ("BBC World",       "http://feeds.bbci.co.uk/news/world/rss.xml"),
+        ("AP News",         "https://feeds.apnews.com/apnews/topnews"),
+        ("Times of Israel", "https://www.timesofisrael.com/feed/"),
     ]
 
     def fetch(source, url, max_entries):
@@ -554,6 +555,8 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
         body       = lines[1].strip() if len(lines) > 1 else ""
         body_html  = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', body)
         body_html  = body_html.replace('\n', '<br>')
+        # Start a new line after each sentence-ending period
+        body_html  = re.sub(r'\.\s+(?=[א-תA-Z])', '.<br>', body_html)
         cards_html += f"""
     <div class="card">
       <div class="card-title">{title}</div>
@@ -565,7 +568,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>בריפינג פיננסי בוקר – {TODAY}</title>
+  <title>תדריך פיננסי יומי – {TODAY}</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -665,7 +668,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
   <div class="wrapper">
     <div class="header">
       <div class="logo">Financial Intelligence Agent</div>
-      <h1>בריפינג פיננסי בוקר</h1>
+      <h1>תדריך פיננסי יומי</h1>
       <div class="date">{date_str}</div>
     </div>
     <div class="accent"></div>
@@ -730,7 +733,7 @@ def main():
     )
 
     print("📧 Sending to all subscribers...")
-    subject     = f"בריפינג פיננסי בוקר – {TODAY}"
+    subject     = f"תדריך פיננסי יומי – {TODAY}"
     subscribers = database.get_active_subscribers()
     print(f"   Found {len(subscribers)} subscriber(s)")
 

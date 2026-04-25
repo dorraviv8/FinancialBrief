@@ -372,7 +372,44 @@ def get_alpha_vantage_movers():
         return {}
 
 
-# ── 11. AI Analysis (Groq – two-call split) ───────────────────────────────────
+# ── 11a. Trend Summary from stored snapshots ──────────────────────────────────
+def build_trend_summary() -> str:
+    """Build a compact time-series summary from yesterday's 5 snapshots.
+    Gives Groq a picture of how markets evolved throughout the day,
+    not just a single end-of-day snapshot.
+    """
+    snapshots = database.get_snapshots_last_24h()
+    if not snapshots:
+        return ""
+
+    lines = ["=== מגמות שוק לאורך יום המסחר האחרון ==="]
+    for snap in snapshots:
+        try:
+            dt_utc = datetime.fromisoformat(snap["time"])
+            dt_il  = dt_utc + timedelta(hours=3)   # UTC → Israel (IDT)
+            t      = dt_il.strftime("%H:%M")
+        except Exception:
+            t = snap["time"][:16]
+
+        d   = snap["data"]
+        spy = d.get("market", {}).get("SPY (S&P 500)", {})
+        vix = d.get("market", {}).get("VIX", {})
+        ta  = d.get("global",  {}).get("TA-125 (תל אביב)", {})
+        fg  = d.get("fear_greed", {})
+        oil = d.get("market", {}).get("Oil (WTI)", {})
+
+        lines.append(
+            f"{t}: SPY {spy.get('price','?')} ({spy.get('arrow','')} {spy.get('change_pct','?')}%) | "
+            f"VIX {vix.get('price','?')} | "
+            f"ת\"א-125 {ta.get('price','?')} ({ta.get('arrow','')} {ta.get('change_pct','?')}%) | "
+            f"נפט {oil.get('price','?')} | "
+            f"סנטימנט: {fg.get('rating','?')} ({fg.get('score','?')})"
+        )
+
+    return "\n".join(lines)
+
+
+# ── 11b. AI Analysis (Groq – two-call split) ──────────────────────────────────
 def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_greed, news, earnings, fred, tase_stocks):
     """Generate the Hebrew brief using two Groq calls to stay under the 12k TPM limit.
     Call 1: US markets, global, macro, sectors, movers, news, conclusions.
@@ -388,7 +425,10 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
     news_world   = [n for n in news if n.get("category") == "world"][:6]
 
     # ── Call 1: US & Global (all sections except Israeli market) ─────────────
+    trend_summary = build_trend_summary()
+
     data_us = (
+        (f"{trend_summary}\n\n" if trend_summary else "") +
         f"שווקים אמריקאים: {json.dumps(market, ensure_ascii=False)}\n"
         f"שווקים גלובליים: {json.dumps(global_mkts, ensure_ascii=False)}\n"
         f"תשואות אג\"ח: {json.dumps(yields, ensure_ascii=False)}\n"
@@ -405,7 +445,7 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
 כללים: במקום "היום" → "היום, {TODAY_SHORT}". במקום "מחר" → "מחר, {TOMORROW_SHORT}". SPY=S&P500, QQQ=נאסד"ק. כל סעיף מתחיל ב-### ואחריו שם הסעיף.
 
 ### סיכום יומי – {TODAY_SHORT}
-ניתוח מקיף: מה קרה, מה הניע, אווירה, נרטיבים שולטים. חשוב: חבר בין האירועים הגלובליים (גיאופוליטיים, מדיניים, כלכליים) לבין תנועות השוק — הצג שרשרת סיבה-ותוצאה. לפחות 6 משפטים.
+ניתוח מקיף: מה קרה, מה הניע, אווירה, נרטיבים שולטים. אם קיימים נתוני מגמות לאורך היום (בנתונים למטה) — השתמש בהם כדי לתאר כיצד השוק התפתח משעה לשעה, לא רק תמונת הסוף. חבר בין האירועים הגלובליים לתנועות השוק — הצג שרשרת סיבה-ותוצאה. לפחות 6 משפטים.
 
 ### גיאופוליטיקה, מגמות ונרטיבים שולטים
 זהה קשרים לא-ברורים בין אירועים עולמיים לשווקים. לכל קשר שאתה מזהה:

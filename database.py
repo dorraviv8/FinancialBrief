@@ -5,7 +5,9 @@ Used by both app.py (signup/unsubscribe) and financial_brief.py (send to all).
 
 import sqlite3
 import secrets
+import json
 import os
+from datetime import datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "subscribers.db")
 
@@ -17,7 +19,7 @@ def get_connection():
 
 
 def init_db():
-    """Create the subscribers table if it doesn't exist."""
+    """Create all tables if they don't exist."""
     with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscribers (
@@ -27,6 +29,13 @@ def init_db():
                 token      TEXT    UNIQUE NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 active     INTEGER DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS market_snapshots (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_time TEXT    NOT NULL,
+                data_json     TEXT    NOT NULL
             )
         """)
         conn.commit()
@@ -75,3 +84,35 @@ def seed_owner(name: str, email: str):
         ).fetchone()
     if not exists:
         add_subscriber(name, email)
+
+
+# ── Market Snapshot Storage ────────────────────────────────────────────────────
+
+def save_market_snapshot(snapshot: dict):
+    """Save a market data snapshot (called 5x/day by gather_data.py)."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO market_snapshots (snapshot_time, data_json) VALUES (?, ?)",
+            (datetime.utcnow().isoformat(), json.dumps(snapshot, ensure_ascii=False))
+        )
+        conn.commit()
+
+
+def get_snapshots_last_24h() -> list:
+    """Return all snapshots from the last 24 hours, oldest first."""
+    cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT snapshot_time, data_json FROM market_snapshots "
+            "WHERE snapshot_time > ? ORDER BY snapshot_time ASC",
+            (cutoff,)
+        ).fetchall()
+    return [{"time": row["snapshot_time"], "data": json.loads(row["data_json"])} for row in rows]
+
+
+def cleanup_old_snapshots(days: int = 7):
+    """Delete snapshots older than N days to keep the DB lean."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM market_snapshots WHERE snapshot_time < ?", (cutoff,))
+        conn.commit()

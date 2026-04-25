@@ -111,6 +111,41 @@ def get_global_markets():
     return results
 
 
+# ── 2b. TASE Trending Stocks (yfinance) ──────────────────────────────────────
+def get_tase_stocks():
+    """Fetch key Israeli stocks from Tel Aviv Stock Exchange."""
+    tase_tickers = {
+        "טבע":            "TEVA.TA",
+        "נייס סיסטמס":    "NICE.TA",
+        "צ'ק פוינט":      "CHKP.TA",
+        "ICL":            "ICL.TA",
+        "אלביט מערכות":   "ESLT.TA",
+        "בנק הפועלים":    "POLI.TA",
+        "בנק לאומי":      "LUMI.TA",
+        "מזרחי טפחות":    "MZTF.TA",
+        "כיל":            "ICL.TA",
+        "אאורה":          "AURA.TA",
+    }
+    results = {}
+    for name, symbol in tase_tickers.items():
+        try:
+            t = yf.Ticker(symbol)
+            hist = t.history(period="2d")
+            if len(hist) >= 2:
+                prev = hist["Close"].iloc[-2]
+                last = hist["Close"].iloc[-1]
+                chg  = ((last - prev) / prev) * 100
+                results[name] = {
+                    "symbol": symbol.replace(".TA", ""),
+                    "price": round(float(last), 2),
+                    "change_pct": round(float(chg), 2),
+                    "arrow": "▲" if chg >= 0 else "▼"
+                }
+        except Exception:
+            pass
+    return results
+
+
 # ── 3. Treasury Yields (yfinance) ─────────────────────────────────────────────
 def get_treasury_yields():
     """Fetch US Treasury yields."""
@@ -182,7 +217,7 @@ def get_sector_performance():
                 prev = hist["Close"].iloc[-2]
                 last = hist["Close"].iloc[-1]
                 chg  = ((last - prev) / prev) * 100
-                results[name] = {"change_pct": round(float(chg), 2), "arrow": "▲" if chg >= 0 else "▼"}
+                results[name] = {"symbol": symbol, "change_pct": round(float(chg), 2), "arrow": "▲" if chg >= 0 else "▼"}
         except Exception:
             pass
     return results
@@ -190,22 +225,39 @@ def get_sector_performance():
 
 # ── 6. Fear & Greed Index (CNN) ───────────────────────────────────────────────
 def get_fear_greed():
-    """Fetch CNN Fear & Greed Index."""
+    """Fetch Fear & Greed Index — tries CNN then falls back to VIX-based estimate."""
+    translations = {
+        "Extreme Fear":  "פחד קיצוני",
+        "Fear":          "פחד",
+        "Neutral":       "ניטרלי",
+        "Greed":         "חמדנות",
+        "Extreme Greed": "חמדנות קיצונית",
+    }
     try:
-        url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        score  = data["fear_and_greed"]["score"]
-        rating = data["fear_and_greed"]["rating"]
-        translations = {
-            "Extreme Fear":  "פחד קיצוני",
-            "Fear":          "פחד",
-            "Neutral":       "ניטרלי",
-            "Greed":         "חמדנות",
-            "Extreme Greed": "חמדנות קיצונית",
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Accept": "application/json",
         }
-        return {"score": round(float(score), 1), "rating": translations.get(rating, rating)}
+        r = requests.get(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            headers=headers, timeout=10
+        )
+        data = r.json()
+        if "fear_and_greed" in data:
+            score  = float(data["fear_and_greed"]["score"])
+            rating = data["fear_and_greed"]["rating"]
+            return {"score": round(score, 1), "rating": translations.get(rating, rating), "source": "CNN"}
+    except Exception:
+        pass
+    # Fallback: derive sentiment from VIX
+    try:
+        vix = float(yf.Ticker("^VIX").history(period="1d")["Close"].iloc[-1])
+        if vix < 12:   score, rating = 82, "חמדנות קיצונית"
+        elif vix < 16: score, rating = 65, "חמדנות"
+        elif vix < 20: score, rating = 50, "ניטרלי"
+        elif vix < 28: score, rating = 32, "פחד"
+        else:          score, rating = 14, "פחד קיצוני"
+        return {"score": score, "rating": rating, "source": f"VIX={round(vix,1)} (אומדן)"}
     except Exception:
         return {"score": "N/A", "rating": "לא זמין"}
 
@@ -303,8 +355,8 @@ def get_alpha_vantage_movers():
 
 
 # ── 11. AI Analysis (Google Gemini) ───────────────────────────────────────────
-def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_greed, news, earnings, fred):
-    """Send all collected data to Gemini and get a full Hebrew brief."""
+def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_greed, news, earnings, fred, tase_stocks):
+    """Send all collected data to Groq and get a full Hebrew brief."""
     client = Groq(api_key=GROQ_API_KEY)
 
     data_summary = f"""
@@ -316,10 +368,13 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
 --- שווקים גלובליים ---
 {json.dumps(global_mkts, ensure_ascii=False, indent=2)}
 
+--- מניות תל אביב (TASE) ---
+{json.dumps(tase_stocks, ensure_ascii=False, indent=2)}
+
 --- תשואות אג"ח אמריקאי ---
 {json.dumps(yields, ensure_ascii=False, indent=2)}
 
---- ביצועי סקטורים ---
+--- ביצועי סקטורים (כולל סימבול ETF) ---
 {json.dumps(sectors, ensure_ascii=False, indent=2)}
 
 --- מדד פחד ותאוות בצע ---
@@ -350,11 +405,22 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
 - SPY מייצג את מדד ה-S&P 500, ו-QQQ מייצג את מדד הנאסד"ק 100
 - כל סעיף חייב להתחיל בשורה ### (שלושה סולמיות) ואחריה שם הסעיף
 
-כתוב את הסעיפים הבאים:
+כתוב את הסעיפים הבאים בסדר הזה בדיוק:
 
 ### סיכום יומי – {TODAY_SHORT}
 סעיף זה חייב להיות הארוך והמפורט ביותר בבריפינג.
 כתוב ניתוח מקיף הכולל: מה קרה בשווקים, מה הניע אותם, מה הייתה האווירה הכללית, אילו נרטיבים שולטים בשוק כרגע, מה ההקשר המאקרו-כלכלי, ואיך כל זה משתלב לתמונה אחת. לפחות 6-8 משפטים.
+
+### שוק ההון הישראלי – {TODAY_SHORT}
+סעיף זה חייב להיות מורחב ומפורט – מופיע מוקדם כי הקורא ישראלי.
+כלול את כל הנקודות הבאות:
+• ביצועי מדד ת"א-125 עם מספרים ואחוזי שינוי
+• מניות מגמה בולטות מהנתונים עם סימבול, מחיר ואחוז שינוי (ציין ▲ או ▼)
+• מומנטום כללי בשוק – האם השוק בעלייה/ירידה ומה מניע אותו
+• שער הדולר/שקל עם פרשנות – האם השקל מתחזק/נחלש ולמה
+• קורלציה עם השווקים הגלובליים – האם ת"א מתכתב עם וול סטריט
+• חדשות כלכליות ישראליות אם קיימות ברשימה
+לפחות 7-9 משפטים.
 
 ### ביצועי מדדים – SPY ו-QQQ
 ביצועי SPY ו-QQQ עם מחירים ואחוזי שינוי מדויקים. כלול גם Dow Jones, Russell 2000, VIX, חוזים עתידיים, זהב, נפט ומטבע קריפטו.
@@ -366,11 +432,12 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
 תשואות אג"ח ל-2, 10 ו-30 שנה. פרש את עקום התשואות ומה המשמעות למשקיעים.
 
 ### מדד פחד ותאוות בצע
-ציון המדד הוא {{}}: 0-25 = פחד קיצוני (שוק מכרה יתר, הזדמנות קנייה אפשרית), 26-45 = פחד, 46-55 = ניטרלי, 56-75 = חמדנות (שוק עולה, זהירות), 76-100 = חמדנות קיצונית (שוק קנה יתר, סיכון תיקון).
-פרש את הציון הנוכחי בהקשר זה והסבר מה זה אומר לגבי הסנטימנט הנוכחי בשוק.
+ציון המדד: 0-25 = פחד קיצוני, 26-45 = פחד, 46-55 = ניטרלי, 56-75 = חמדנות, 76-100 = חמדנות קיצונית.
+פרש את הציון הנוכחי לפי סולם זה והסבר מה זה אומר על הסנטימנט בשוק.
 
 ### סבב סקטורים
-אילו סקטורים מובילים ואילו מפגרים. נתח מה זה מעיד על הרוטציה בשוק.
+לכל סקטור ציין את שם הסקטור, סימבול ה-ETF שלו (מהנתונים), אחוז השינוי וחץ ▲/▼.
+נתח מה הרוטציה הזו מעידה על כיוון השוק.
 
 ### מניות בולטות – עולי ויורדי שער
 מניות שעלו/ירדו בצורה חריגה עם אחוזים. נסה להסביר את הסיבה אם ידועה מהחדשות.
@@ -381,10 +448,6 @@ def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_gre
 
 ### ניתוח חדשות מרכזיות
 5-7 כותרות חשובות עם ניתוח קצר של כל אחת – מה המשמעות למשקיעים.
-
-### שוק ההון הישראלי
-סעיף זה חייב להיות מורחב ומפורט.
-כלול: ביצועי מדד ת"א-125 עם מספרים, ניתוח הסקטורים המובילים בבורסה הישראלית, שער הדולר/שקל עם פרשנות, השפעת האירועים הגלובליים על השוק הישראלי, חדשות כלכליות ישראליות מהרשימה אם קיימות, והמלצות מה לעקוב אחריו בשוק הישראלי. לפחות 6-8 משפטים.
 
 ### מסקנות ומה לעקוב אחריו היום, {TODAY_SHORT}
 3-5 נקודות מפתח ממוספרות. לכל נקודה – מה לעקוב ולמה זה חשוב.
@@ -486,31 +549,38 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     }}
     /* ── Bubble Cards ── */
     .card {{
-      background: #161b27;
-      border: 1px solid #232d42;
+      background: #1e2637;
+      border: 1px solid #2d3d58;
       border-radius: 14px;
       padding: 20px 24px 18px;
       margin-bottom: 14px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+      box-shadow: 0 2px 12px rgba(0,0,0,0.25);
     }}
     .card-title {{
-      font-size: 14px;
+      font-size: 15px;
       font-weight: 700;
       color: #f0c040;
-      border-bottom: 1px solid #2a3a56;
+      border-bottom: 1px solid #2d3d58;
       padding-bottom: 10px;
       margin-bottom: 13px;
       letter-spacing: 0.3px;
+      direction: rtl;
+      text-align: right;
     }}
     .card-body {{
       font-size: 14px;
       line-height: 1.9;
-      color: #b8c8d8;
+      color: #c8d8e8;
+      direction: rtl;
+      text-align: right;
+      unicode-bidi: embed;
+    }}
+    .card-body * {{
       direction: rtl;
       text-align: right;
     }}
     strong {{
-      color: #e8d090;
+      color: #f0d878;
       font-weight: 600;
     }}
     /* ── Footer ── */
@@ -571,6 +641,7 @@ def main():
     print("📈 Collecting US market data...")
     market      = get_market_snapshot()
     global_mkts = get_global_markets()
+    tase_stocks = get_tase_stocks()
     yields      = get_treasury_yields()
     movers      = get_top_movers()
     sectors     = get_sector_performance()
@@ -588,7 +659,7 @@ def main():
     print("🤖 Generating Hebrew brief with Groq AI...")
     brief_text = generate_hebrew_brief(
         market, global_mkts, yields, movers,
-        sectors, fear_greed, news, earnings, fred
+        sectors, fear_greed, news, earnings, fred, tase_stocks
     )
 
     print("📧 Sending to all subscribers...")

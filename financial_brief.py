@@ -573,20 +573,20 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
       font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
-      background: #0d1117;
+      background: #e8edf4;
       direction: rtl;
       text-align: right;
-      color: #cdd6e0;
+      color: #1e2d42;
     }}
     .wrapper {{
       max-width: 680px;
       margin: 0 auto;
       padding: 24px 16px 40px;
     }}
-    /* ── Header ── */
+    /* ── Header — dark navy anchor, gold title ── */
     .header {{
-      background: linear-gradient(135deg, #111827 0%, #1a2f52 60%, #1e3a6e 100%);
-      border: 1px solid #2a3f6a;
+      background: linear-gradient(135deg, #1a3a6e 0%, #1e4d8c 60%, #1a3a6e 100%);
+      border: 1px solid #2a509a;
       border-radius: 16px;
       padding: 34px 36px 28px;
       text-align: center;
@@ -594,7 +594,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     }}
     .header .logo {{
       font-size: 10px;
-      color: #5a7fa8;
+      color: #7aaad8;
       letter-spacing: 4px;
       text-transform: uppercase;
       margin-bottom: 12px;
@@ -607,7 +607,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
       letter-spacing: 0.5px;
     }}
     .header .date {{
-      color: #8aaac8;
+      color: #a8c8e8;
       font-size: 14px;
     }}
     /* ── Gold accent line ── */
@@ -619,28 +619,28 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     }}
     /* ── Bubble Cards ── */
     .card {{
-      background: #1e2637;
-      border: 1px solid #2d3d58;
+      background: #ffffff;
+      border: 1px solid #c8d8ea;
       border-radius: 14px;
-      padding: 20px 24px 18px;
+      padding: 22px 26px 20px;
       margin-bottom: 14px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+      box-shadow: 0 2px 10px rgba(30,60,100,0.08);
     }}
     .card-title {{
-      font-size: 15px;
+      font-size: 16px;
       font-weight: 700;
-      color: #f0c040;
-      border-bottom: 1px solid #2d3d58;
+      color: #1a3a6e;
+      border-bottom: 2px solid #dce8f4;
       padding-bottom: 10px;
-      margin-bottom: 13px;
+      margin-bottom: 14px;
       letter-spacing: 0.3px;
       direction: rtl;
       text-align: right;
     }}
     .card-body {{
-      font-size: 14px;
-      line-height: 1.9;
-      color: #c8d8e8;
+      font-size: 15px;
+      line-height: 2.0;
+      color: #2c3e52;
       direction: rtl;
       text-align: right;
       unicode-bidi: embed;
@@ -650,15 +650,15 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
       text-align: right;
     }}
     strong {{
-      color: #f0d878;
-      font-weight: 600;
+      color: #0f2d5e;
+      font-weight: 700;
     }}
     /* ── Footer ── */
     .footer {{
       text-align: center;
       padding: 18px 20px 4px;
       font-size: 11px;
-      color: #3a5070;
+      color: #7a90a8;
       direction: rtl;
       line-height: 1.8;
     }}
@@ -675,9 +675,9 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     {cards_html}
     <div class="footer">
       נוצר אוטומטית ב-{TODAY} &nbsp;|&nbsp; Yahoo Finance · FRED · Finnhub · Alpha Vantage · RSS<br>
-      <a href="{unsubscribe_url}" style="color:#3a5a7a; font-size:11px;">ביטול הרשמה</a>
+      <a href="{unsubscribe_url}" style="color:#4a7aaa; font-size:11px;">ביטול הרשמה</a>
       &nbsp;|&nbsp;
-      <span style="color:#2a3d55;">המידע מיועד לצרכי מידע בלבד ואינו מהווה ייעוץ השקעות</span>
+      <span style="color:#8a9fb8;">המידע מיועד לצרכי מידע בלבד ואינו מהווה ייעוץ השקעות</span>
     </div>
   </div>
 </body>

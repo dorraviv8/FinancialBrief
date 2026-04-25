@@ -283,7 +283,7 @@ def get_news_rss():
                     all_headlines.append({"source": source, "title": title})
         except Exception:
             pass
-    return all_headlines[:20]
+    return all_headlines[:10]
 
 
 # ── 8. Finnhub – Earnings Calendar ────────────────────────────────────────────
@@ -352,137 +352,114 @@ def get_alpha_vantage_movers():
         return {}
 
 
-# ── 11. AI Analysis (Google Gemini) ───────────────────────────────────────────
+# ── 11. AI Analysis (Groq – two-call split) ───────────────────────────────────
 def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_greed, news, earnings, fred, tase_stocks):
-    """Send all collected data to Groq and get a full Hebrew brief."""
+    """Generate the Hebrew brief using two Groq calls to stay under the 12k TPM limit.
+    Call 1: US markets, global, macro, sectors, movers, news, conclusions.
+    Call 2: Israeli market only.
+    Results are stitched together into one brief before sending.
+    """
     client = Groq(api_key=GROQ_API_KEY)
 
-    data_summary = f"""
-=== נתוני שוק להיום {TODAY} ===
+    # Split news: Israeli sources go to Call 2, everything else to Call 1
+    israeli_sources = {"Calcalist (כלכליסט)", "Globes (גלובס)"}
+    news_global = [n for n in news if n["source"] not in israeli_sources][:7]
+    news_israel = [n for n in news if n["source"] in israeli_sources][:5]
 
---- שווקים אמריקאים ---
-{json.dumps(market, ensure_ascii=False, indent=2)}
+    # ── Call 1: US & Global (all sections except Israeli market) ─────────────
+    data_us = (
+        f"שווקים אמריקאים: {json.dumps(market, ensure_ascii=False)}\n"
+        f"שווקים גלובליים: {json.dumps(global_mkts, ensure_ascii=False)}\n"
+        f"תשואות אג\"ח: {json.dumps(yields, ensure_ascii=False)}\n"
+        f"סקטורים: {json.dumps(sectors, ensure_ascii=False)}\n"
+        f"פחד ותאוות בצע: {json.dumps(fear_greed, ensure_ascii=False)}\n"
+        f"עולי/יורדי שער: {json.dumps(movers, ensure_ascii=False)}\n"
+        f"רווחים היום: {json.dumps(earnings, ensure_ascii=False)}\n"
+        f"מאקרו FRED: {json.dumps(fred, ensure_ascii=False)}\n"
+        f"כותרות: {json.dumps(news_global, ensure_ascii=False)}"
+    )
 
---- שווקים גלובליים ---
-{json.dumps(global_mkts, ensure_ascii=False, indent=2)}
-
---- מניות תל אביב (TASE) ---
-{json.dumps(tase_stocks, ensure_ascii=False, indent=2)}
-
---- תשואות אג"ח אמריקאי ---
-{json.dumps(yields, ensure_ascii=False, indent=2)}
-
---- ביצועי סקטורים (כולל סימבול ETF) ---
-{json.dumps(sectors, ensure_ascii=False, indent=2)}
-
---- מדד פחד ותאוות בצע ---
-{json.dumps(fear_greed, ensure_ascii=False, indent=2)}
-
---- עולי ויורדי שער ---
-{json.dumps(movers, ensure_ascii=False, indent=2)}
-
---- פרסומי רווחים היום ---
-{json.dumps(earnings, ensure_ascii=False, indent=2)}
-
---- אינדיקטורים מאקרו (FRED) ---
-{json.dumps(fred, ensure_ascii=False, indent=2)}
-
---- כותרות חדשות ---
-{json.dumps(news, ensure_ascii=False, indent=2)}
-"""
-
-    prompt = f"""
-אתה אנליסט פיננסי בכיר ומומחה לשווקי ההון. קיבלת נתוני שוק מקיפים להיום.
-עליך לכתוב בריפינג בוקר מלא ומקצועי **בעברית בלבד**.
-
-חשוב מאוד:
-- השתמש אך ורק בטרמינולוגיה פיננסית עברית מקצועית כפי שנהוג בכלכליסט ובגלובס
-- אל תשתמש במילים באנגלית – תרגם הכל לעברית פיננסית תקנית
-- הסגנון: מקצועי, תמציתי, מדויק, קריא
-- במקום המילה "היום" כתוב תמיד "היום, {TODAY_SHORT}" ובמקום "מחר" כתוב "מחר, {TOMORROW_SHORT}"
-- SPY מייצג את מדד ה-S&P 500, ו-QQQ מייצג את מדד הנאסד"ק 100
-- כל סעיף חייב להתחיל בשורה ### (שלושה סולמיות) ואחריה שם הסעיף
-
-כתוב את הסעיפים הבאים בסדר הזה בדיוק:
+    prompt_us = f"""אתה אנליסט פיננסי בכיר. כתוב בריפינג בוקר **בעברית בלבד**, טרמינולוגיה כמו בכלכליסט/גלובס.
+כללים: במקום "היום" → "היום, {TODAY_SHORT}". במקום "מחר" → "מחר, {TOMORROW_SHORT}". SPY=S&P500, QQQ=נאסד"ק. כל סעיף מתחיל ב-### ואחריו שם הסעיף.
 
 ### סיכום יומי – {TODAY_SHORT}
-סעיף זה חייב להיות הארוך והמפורט ביותר בבריפינג.
-כתוב ניתוח מקיף הכולל: מה קרה בשווקים, מה הניע אותם, מה הייתה האווירה הכללית, אילו נרטיבים שולטים בשוק כרגע, מה ההקשר המאקרו-כלכלי, ואיך כל זה משתלב לתמונה אחת. לפחות 6-8 משפטים.
-
-### שוק ההון הישראלי – {TODAY_SHORT}
-סעיף זה חייב להיות מורחב ומפורט – מופיע מוקדם כי הקורא ישראלי.
-כלול את כל הנקודות הבאות:
-• ביצועי מדד ת"א-125 עם מספרים ואחוזי שינוי
-• מניות מגמה בולטות מהנתונים עם סימבול, מחיר ואחוז שינוי (ציין ▲ או ▼)
-• מומנטום כללי בשוק – האם השוק בעלייה/ירידה ומה מניע אותו
-• שער הדולר/שקל עם פרשנות – האם השקל מתחזק/נחלש ולמה
-• קורלציה עם השווקים הגלובליים – האם ת"א מתכתב עם וול סטריט
-• חדשות כלכליות ישראליות אם קיימות ברשימה
-לפחות 7-9 משפטים.
+מה קרה, מה הניע, אווירה, נרטיבים שולטים, הקשר מאקרו. לפחות 6 משפטים.
 
 ### השווקים האמריקאים והכלכלה – מבט כולל
-סעיף זה נותן תמונה מלאה ותמציתית של מצב הכלכלה והשווקים בארה"ב.
-כלול את כל הנקודות הבאות:
-• ביצועי SPY ו-QQQ עם מחירים ואחוזי שינוי מדויקים, וכן Dow Jones, Russell 2000
-• מצב ה-VIX ומה הוא מסמן לגבי רמת הסיכון בשוק
-• חוזים עתידיים, זהב, נפט – מה התנועות אומרות על ציפיות השוק
-• מצב הכלכלה האמריקאית: מה האינדיקטורים המאקרו האחרונים (CPI, תעסוקה, GDP) אומרים – **תן מספרים ספציפיים מהנתונים ולא רק שמות**
-• מדיניות הפד: מה עמדת הפד הנוכחית, האם צפויות הורדות/העלאות ריבית ומתי
-• תשואות האג"ח ל-2, 10 ו-30 שנה ומה עקום התשואות מסמן
-• האם יש נרטיב שולט בשוק (למשל: חשש ממיתון, אופטימיות לגבי AI, מתיחות גיאופוליטית)
-הסעיף צריך להיות קצר אך מקיף – 6-8 משפטים עם מספרים.
-
-### שוק ההון הישראלי – {TODAY_SHORT}
-סעיף זה חייב להיות מורחב ומפורט – מופיע מוקדם כי הקורא ישראלי.
-כלול את כל הנקודות הבאות:
-• ביצועי מדד ת"א-125 עם מספרים ואחוזי שינוי
-• מניות מגמה בולטות מהנתונים עם סימבול, מחיר ואחוז שינוי (ציין ▲ או ▼)
-• מומנטום כללי בשוק – האם השוק בעלייה/ירידה ומה מניע אותו
-• שער הדולר/שקל עם פרשנות – האם השקל מתחזק/נחלש ולמה
-• קורלציה עם השווקים הגלובליים – האם ת"א מתכתב עם וול סטריט
-• חדשות כלכליות ישראליות אם קיימות ברשימה
-לפחות 7-9 משפטים.
+SPY/QQQ/דאו/ראסל עם מחירים ואחוזים. VIX. חוזים, זהב, נפט. מאקרו עם מספרים. מדיניות הפד. תשואות אג"ח 2/10/30. 6-8 משפטים.
 
 ### שווקים גלובליים
-ביצועי אסיה ואירופה עם מספרים. הסבר קצר אם יש תנועה חריגה.
+אסיה ואירופה עם מספרים. הסבר קצר לתנועה חריגה.
 
 ### מדד פחד ותאוות בצע
-ציון המדד: 0-25 = פחד קיצוני, 26-45 = פחד, 46-55 = ניטרלי, 56-75 = חמדנות, 76-100 = חמדנות קיצונית.
-פרש את הציון הנוכחי לפי סולם זה והסבר מה זה אומר על הסנטימנט בשוק.
+0-25=פחד קיצוני, 26-45=פחד, 46-55=ניטרלי, 56-75=חמדנות, 76-100=חמדנות קיצונית. פרש את הציון.
 
 ### סבב סקטורים
-לכל סקטור ציין את שם הסקטור, סימבול ה-ETF שלו (מהנתונים), אחוז השינוי וחץ ▲/▼.
-נתח מה הרוטציה הזו מעידה על כיוון השוק.
+לכל סקטור: שם, סימבול ETF, אחוז שינוי, חץ ▲/▼. נתח מה הרוטציה מעידה.
 
 ### מניות בולטות – עולי ויורדי שער
-מניות שעלו/ירדו בצורה חריגה עם אחוזים. נסה להסביר את הסיבה אם ידועה מהחדשות.
+מניות חריגות עם אחוזים. הסבר סיבה אם ידועה.
 
 ### יומן אירועים כלכליים – היום, {TODAY_SHORT} ומחר, {TOMORROW_SHORT}
-**חשוב: כלול רק אירועים משמעותיים** כגון: החלטות ריבית פד, נתוני CPI/PPI/GDP/תעסוקה, פרסומי רווחים של חברות גדולות (שווי שוק מעל 100 מיליארד דולר), נאומי יו"ר הפד.
-אם אין אירועים משמעותיים – כתוב: "אין אירועים מהותיים צפויים היום, {TODAY_SHORT}."
+רק אירועים משמעותיים (ריבית פד, CPI/PPI/GDP, רווחים >100B$, נאומי הפד). אם אין – "אין אירועים מהותיים צפויים היום, {TODAY_SHORT}."
 
 ### ניתוח חדשות מרכזיות
-5-7 חדשות חשובות. לכל חדשה:
-• **כותרת הנושא** – שורה אחת
-• **מה קרה בפועל** – הסבר ספציפי עם מספרים ועובדות. אל תכתוב "נמסרו נתוני אינפלציה" – כתוב "מדד המחירים לצרכן עלה ב-X% בחודש Y, מעל/מתחת לתחזית של Z%"
-• **המשמעות למשקיעים** – משפט אחד על ההשלכות
-כל חדשה – 3-4 שורות. אל תקצר ואל תסתפק בשמות של נושאים בלבד.
+5-6 חדשות. לכל חדשה: כותרת נושא, מה קרה עם מספרים, משמעות למשקיעים.
 
 ### מסקנות ומה לעקוב אחריו היום, {TODAY_SHORT}
-3-5 נקודות מפתח ממוספרות. לכל נקודה – מה לעקוב ולמה זה חשוב.
+3-4 נקודות ממוספרות.
 
----
-הנתונים:
-{data_summary}
-"""
+נתונים:
+{data_us}"""
 
-    response = client.chat.completions.create(
+    resp1 = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": prompt_us}],
         temperature=0.3,
-        max_tokens=8000,
+        max_tokens=5000,
     )
-    return response.choices[0].message.content
+    brief_us = resp1.choices[0].message.content
+
+    # ── Call 2: Israeli Market only ───────────────────────────────────────────
+    data_israel = (
+        f"מניות ת\"א: {json.dumps(tase_stocks, ensure_ascii=False)}\n"
+        f"מדד ת\"א-125: {json.dumps(global_mkts.get('TA-125 (תל אביב)', {}), ensure_ascii=False)}\n"
+        f"דולר/שקל: {json.dumps(market.get('USD/ILS', {}), ensure_ascii=False)}\n"
+        f"S&P500 (לקורלציה): {json.dumps(market.get('SPY (S&P 500)', {}), ensure_ascii=False)}\n"
+        f"כותרות ישראליות: {json.dumps(news_israel, ensure_ascii=False)}"
+    )
+
+    prompt_israel = f"""אתה אנליסט פיננסי בכיר. כתוב **בעברית בלבד** כמו בכלכליסט/גלובס.
+במקום "היום" → "היום, {TODAY_SHORT}". כל סעיף מתחיל ב-### ואחריו שם הסעיף.
+
+### שוק ההון הישראלי – {TODAY_SHORT}
+• ביצועי מדד ת"א-125 עם מספרים ואחוזי שינוי
+• מניות מגמה בולטות: סימבול, מחיר, אחוז שינוי, חץ ▲/▼
+• מומנטום כללי – עלייה/ירידה ומה מניע
+• שער דולר/שקל עם פרשנות
+• קורלציה עם וול סטריט
+• חדשות כלכליות ישראליות אם קיימות
+לפחות 7 משפטים.
+
+נתונים:
+{data_israel}"""
+
+    resp2 = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt_israel}],
+        temperature=0.3,
+        max_tokens=2000,
+    )
+    brief_israel = resp2.choices[0].message.content
+
+    # ── Stitch together: Israel section goes after the daily summary ──────────
+    # Split Call 1 output into individual ### sections
+    sections = re.split(r'\n(?=###)', brief_us.strip())
+    if len(sections) >= 2:
+        # sections[0] = daily summary, sections[1:] = everything else
+        return sections[0] + "\n\n" + brief_israel.strip() + "\n\n" + "\n\n".join(sections[1:])
+    # Fallback: append Israel at the end
+    return brief_us + "\n\n" + brief_israel
 
 
 # ── 12. HTML Email Builder ─────────────────────────────────────────────────────

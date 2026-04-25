@@ -115,16 +115,15 @@ def get_global_markets():
 def get_tase_stocks():
     """Fetch key Israeli stocks from Tel Aviv Stock Exchange."""
     tase_tickers = {
-        "טבע":            "TEVA.TA",
-        "נייס סיסטמס":    "NICE.TA",
-        "צ'ק פוינט":      "CHKP.TA",
-        "ICL":            "ICL.TA",
-        "אלביט מערכות":   "ESLT.TA",
-        "בנק הפועלים":    "POLI.TA",
-        "בנק לאומי":      "LUMI.TA",
-        "מזרחי טפחות":    "MZTF.TA",
-        "כיל":            "ICL.TA",
-        "אאורה":          "AURA.TA",
+        "טבע":          "TEVA.TA",
+        "נייס סיסטמס":  "NICE.TA",
+        "ICL":          "ICL.TA",
+        "אלביט מערכות": "ESLT.TA",
+        "בנק הפועלים":  "POLI.TA",
+        "בנק לאומי":    "LUMI.TA",
+        "מזרחי טפחות":  "MZTF.TA",
+        "רדקום":        "RDCM.TA",
+        "ביג":          "BIG.TA",
     }
     results = {}
     for name, symbol in tase_tickers.items():
@@ -278,14 +277,14 @@ def get_news_rss():
     for source, url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
+            for entry in feed.entries[:3]:
                 title   = entry.get("title", "").strip()
-                summary = entry.get("summary", "")[:300].strip()
+                summary = entry.get("summary", "")[:120].strip()
                 if title:
                     all_headlines.append({"source": source, "title": title, "summary": summary})
         except Exception:
             pass
-    return all_headlines[:40]
+    return all_headlines[:20]
 
 
 # ── 8. Finnhub – Earnings Calendar ────────────────────────────────────────────

@@ -856,6 +856,8 @@ def main():
     database.init_db()
     if OWNER_EMAIL:
         database.seed_owner(OWNER_NAME, OWNER_EMAIL)
+    backup_status = database.snapshot_subscribers_once_daily()
+    print(f"💾 Subscriber backup: {backup_status}")
 
     print("📈 Collecting US market data...")
     market      = get_market_snapshot()

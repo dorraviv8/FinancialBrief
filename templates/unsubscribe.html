@@ -47,13 +47,13 @@
       <h1>הסרת הרשמה בוצעה</h1>
       <p class="message">הוסרת בהצלחה מרשימת התפוצה.<br>לא תקבל יותר את הבריפינג היומי.</p>
       <div class="accent"></div>
-      <p style="font-size:13px; color:#3a5272;">שינית את דעתך? <a href="/">לחץ כאן להרשמה מחדש</a></p>
+      <p style="font-size:13px; color:#3a5272;">שינית את דעתך? <a href="{{ url_for('signup') }}">לחץ כאן להרשמה מחדש</a></p>
     {% else %}
       <div class="icon">❓</div>
       <h1>קישור לא תקין</h1>
       <p class="message">הקישור אינו תקין או שכבר בוצע ביטול הרשמה בעבר.</p>
       <div class="accent"></div>
-      <a href="/">חזרה לדף הבית</a>
+      <a href="{{ url_for('signup') }}">חזרה לדף הבית</a>
     {% endif %}
   </div>
 </body>

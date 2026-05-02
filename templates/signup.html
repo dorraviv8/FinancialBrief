@@ -141,7 +141,7 @@
     <div class="errors">{% for e in errors %}{{ e }}<br>{% endfor %}</div>
     {% endif %}
 
-    <form method="POST" action="/signup">
+    <form method="POST" action="{{ url_for('do_signup') }}">
       <label for="name">שם מלא</label>
       <input type="text" id="name" name="name" placeholder="ישראל ישראלי" value="{{ name or '' }}" required>
 

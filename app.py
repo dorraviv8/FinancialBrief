@@ -7,17 +7,20 @@ import re
 import os
 from flask import Flask, render_template, request, redirect, url_for
 from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 import database
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", os.urandom(32))
+app.wsgi_app = ProxyFix(app.wsgi_app, x_prefix=1)
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Initialise DB on startup
 database.init_db()
+database.snapshot_subscribers_once_daily()
 
 
 @app.route("/", methods=["GET"])
@@ -56,4 +59,5 @@ def unsubscribe(token):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app_port = int(os.getenv("APP_PORT", "5000"))
+    app.run(host="0.0.0.0", port=app_port, debug=False)

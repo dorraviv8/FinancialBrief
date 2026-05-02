@@ -1,0 +1,11 @@
+- .env
+- *.env
+- subscribers.db
+- fin_env/
+- venv/
+- env/
+- __pycache__/
+- *.pyc
+- *.log
+- logs/
+- .git/

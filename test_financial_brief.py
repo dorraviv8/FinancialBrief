@@ -243,6 +243,141 @@ class IsraelMarketTests(unittest.TestCase):
         for symbol in ("LUMI", "POLI", "MZTF"):
             self.assertIn(symbol, cards)
 
+    def test_market_snapshot_and_index_cards_show_official_closing_date(self):
+        data = {
+            "indices": {
+                name: {
+                    "last_value": 2500,
+                    "change_1d_pct": 0.5,
+                    "breadth": {},
+                    "trend": {"available": False, "as_of": "2026-08-25"},
+                }
+                for name in ("ת״א-35", "ת״א-90", "ת״א-125")
+            }
+        }
+
+        notice = financial_brief._market_close_notice(data)
+        cards = financial_brief.build_quantitative_cards(data)
+
+        self.assertIn("סגירת המסחר ביום 25.08.2026", notice)
+        self.assertEqual(cards.count("נתוני הסגירה ליום 25.08.2026"), 3)
+
+    def test_sector_chart_is_split_into_plain_language_rows(self):
+        summary = financial_brief._sector_chart_summary({
+            "available": True,
+            "as_of": "2026-08-25",
+            "sessions": 241,
+            "return_20d_pct": 1.2,
+            "return_3m_pct": 2.3,
+            "return_6m_pct": 3.4,
+            "return_1y_pct": 4.5,
+            "above_sma_20": True,
+            "above_sma_50": True,
+            "above_sma_200": False,
+            "rsi_14": 55,
+            "macd_histogram": 0.5,
+            "support_60d": 100,
+            "resistance_60d": 120,
+            "turnover_vs_20d_avg": 1.1,
+            "directional_bias": "חיובית",
+        })
+
+        rendered = "\n".join(summary)
+        for label in (
+            "תקופת הגרף",
+            "ביצועים",
+            "כיוון המגמה",
+            "עוצמת התנועה",
+            "רמות שכדאי לעקוב אחריהן",
+        ):
+            self.assertIn(label, rendered)
+        self.assertIn("אזור תמיכה, שבו ירידות נבלמו לאחרונה", rendered)
+        self.assertEqual(financial_brief._hebrew_count(1, "יורדת", "יורדות"), "1 יורדת")
+        self.assertEqual(financial_brief._hebrew_count(3, "יורדת", "יורדות"), "3 יורדות")
+
+    def test_sector_graph_score_rewards_stronger_multiweek_data(self):
+        strong = {
+            "breadth": {"advancers": 8, "decliners": 2},
+            "trend": {
+                "available": True,
+                "return_20d_pct": 8,
+                "return_3m_pct": 16,
+                "return_6m_pct": 25,
+                "return_1y_pct": 40,
+                "above_sma_20": True,
+                "above_sma_50": True,
+                "above_sma_200": True,
+                "rsi_14": 58,
+                "macd_histogram": 2,
+                "directional_bias": "חיובית",
+                "annualized_volatility_pct": 20,
+            },
+        }
+        weak = {
+            "breadth": {"advancers": 2, "decliners": 8},
+            "trend": {
+                "available": True,
+                "return_20d_pct": -8,
+                "return_3m_pct": -16,
+                "return_6m_pct": -25,
+                "return_1y_pct": -40,
+                "above_sma_20": False,
+                "above_sma_50": False,
+                "above_sma_200": False,
+                "rsi_14": 25,
+                "macd_histogram": -2,
+                "directional_bias": "שלילית",
+                "annualized_volatility_pct": 45,
+            },
+        }
+
+        strong_score = financial_brief.calculate_sector_graph_score(strong)
+        weak_score = financial_brief.calculate_sector_graph_score(weak)
+
+        self.assertGreaterEqual(strong_score, 75)
+        self.assertLessEqual(weak_score, 30)
+        self.assertGreater(strong_score, weak_score)
+
+    def test_news_adjustment_is_bounded_and_score_is_added_to_sector_card(self):
+        sector = {
+            "breadth": {"advancers": 5, "decliners": 5},
+            "trend": {
+                "available": True,
+                "as_of": "2026-08-25",
+                "sessions": 241,
+                "return_20d_pct": 0,
+                "return_3m_pct": 0,
+                "return_6m_pct": 0,
+                "return_1y_pct": 0,
+                "above_sma_20": True,
+                "above_sma_50": False,
+                "above_sma_200": True,
+                "rsi_14": 55,
+                "macd_histogram": 0,
+                "directional_bias": "ניטרלית",
+                "annualized_volatility_pct": 30,
+            },
+            "top_stocks_by_market_cap": [],
+        }
+        data = {"indices": {}, "sectors": {"טכנולוגיה": sector}}
+
+        scores = financial_brief._parse_sector_scores(
+            data,
+            "SCORE|טכנולוגיה|99|כותרת חיובית שסופקה",
+        )
+        cards = financial_brief.build_quantitative_cards(data, scores)
+
+        self.assertEqual(scores["טכנולוגיה"]["news_adjustment"], 10)
+        self.assertEqual(
+            scores["טכנולוגיה"]["final_score"],
+            min(100, scores["טכנולוגיה"]["graph_score"] + 10),
+        )
+        self.assertIn("ציון אטרקטיביות להשקעה כעת", cards)
+        self.assertIn("השפעת החדשות: +10 נקודות", cards)
+        self.assertNotIn("SCORE|", financial_brief._strip_score_protocol(
+            "SCORE|טכנולוגיה|2|סיבה\n### סעיף\nתוכן"
+        ))
+
     def test_source_context_cards_include_official_and_press_sources(self):
         cards = financial_brief.build_source_context_cards({
             "exchange_rates": {
@@ -286,8 +421,15 @@ class IsraelMarketTests(unittest.TestCase):
         financial_brief.generate_hebrew_brief({"indices": {}, "sectors": {}})
 
         self.assertEqual(mock_completion.call_count, 2)
-        self.assertEqual(mock_completion.call_args_list[0].kwargs["max_tokens"], 900)
-        self.assertEqual(mock_completion.call_args_list[1].kwargs["max_tokens"], 700)
+        self.assertEqual(mock_completion.call_args_list[0].kwargs["max_tokens"], 1200)
+        self.assertEqual(mock_completion.call_args_list[1].kwargs["max_tokens"], 1100)
+        market_prompt = mock_completion.call_args_list[0].args[2]
+        sector_prompt = mock_completion.call_args_list[1].args[2]
+        self.assertIn("הכיוון הסביר", market_prompt)
+        self.assertIn("מתי נשנה את ההערכה", market_prompt)
+        self.assertIn("אסור להשתמש בלי הסבר", market_prompt)
+        self.assertIn("SCORE|שם הסקטור", sector_prompt)
+        self.assertIn("בין 10- ל-10+ בלבד", sector_prompt)
         mock_groq.return_value.models.list.assert_not_called()
 
     def test_html_email_escapes_ai_html_and_renders_markdown_links(self):

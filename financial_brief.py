@@ -131,13 +131,166 @@ def _compact_sector_overview(data: dict) -> dict:
         "as_of": data.get("as_of"),
         "sectors": {
             name: {
+                "graph_score_0_100": calculate_sector_graph_score(sector),
                 "change_1d_pct": sector.get("change_1d_pct"),
                 "breadth": sector.get("breadth"),
                 "trend": _compact_technical(sector.get("trend")),
+                "largest_stocks": [
+                    stock.get("symbol") or stock.get("name")
+                    for stock in sector.get("top_stocks_by_market_cap", [])
+                ],
             }
             for name, sector in data.get("sectors", {}).items()
         },
     }
+
+
+def _compact_sector_news(data: dict) -> list[dict]:
+    items = []
+    for item in data.get("maya_announcements", [])[:5]:
+        items.append({
+            "source": item.get("source"),
+            "reliability": item.get("reliability"),
+            "title": item.get("title"),
+            "companies": item.get("companies", []),
+        })
+    for item in data.get("news", [])[:8]:
+        items.append({
+            "source": item.get("source"),
+            "reliability": item.get("reliability"),
+            "title": item.get("title"),
+        })
+    return items
+
+
+def _clamp(value: float, minimum: float = 0, maximum: float = 100) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _normalized_score(value, lower: float, upper: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 50.0
+    return _clamp(((numeric - lower) / (upper - lower)) * 100)
+
+
+def calculate_sector_graph_score(sector: dict) -> int:
+    """Score graph strength for a balanced 2–6 week horizon.
+
+    The score is deliberately deterministic and transparent. AI may later
+    adjust it by at most ten points when supplied Israeli news is directly
+    relevant to the sector.
+    """
+    trend = sector.get("trend", {})
+    if not trend.get("available"):
+        return 50
+
+    weighted_parts = [
+        (_normalized_score(trend.get("return_20d_pct"), -10, 10), 0.10),
+        (_normalized_score(trend.get("return_3m_pct"), -20, 20), 0.12),
+        (_normalized_score(trend.get("return_6m_pct"), -30, 30), 0.10),
+        (_normalized_score(trend.get("return_1y_pct"), -50, 50), 0.08),
+    ]
+
+    sma_values = []
+    for period in (20, 50, 200):
+        state = trend.get(f"above_sma_{period}")
+        sma_values.append(50 if state is None else 100 if state else 0)
+    weighted_parts.append((sum(sma_values) / len(sma_values), 0.18))
+
+    breadth = sector.get("breadth", {})
+    advancers = float(breadth.get("advancers") or 0)
+    decliners = float(breadth.get("decliners") or 0)
+    breadth_score = (
+        (advancers / (advancers + decliners)) * 100
+        if advancers + decliners
+        else 50
+    )
+    weighted_parts.append((breadth_score, 0.12))
+
+    try:
+        rsi_score = _clamp(100 - (abs(float(trend.get("rsi_14")) - 55) * 3))
+    except (TypeError, ValueError):
+        rsi_score = 50
+    weighted_parts.append((rsi_score, 0.10))
+
+    try:
+        macd = float(trend.get("macd_histogram"))
+    except (TypeError, ValueError):
+        macd = None
+    macd_score = 50 if macd is None else 75 if macd > 0 else 25 if macd < 0 else 50
+    weighted_parts.append((macd_score, 0.08))
+
+    bias_score = {"חיובית": 80, "ניטרלית": 50, "שלילית": 20}.get(
+        trend.get("directional_bias"), 50
+    )
+    weighted_parts.append((bias_score, 0.07))
+
+    volatility_score = 100 - _normalized_score(
+        trend.get("annualized_volatility_pct"), 15, 50
+    )
+    weighted_parts.append((volatility_score, 0.05))
+
+    return int(round(sum(score * weight for score, weight in weighted_parts)))
+
+
+def _sector_score_label(score: int) -> str:
+    if score >= 85:
+        return "חזקה מאוד"
+    if score >= 70:
+        return "חזקה"
+    if score >= 55:
+        return "חיובית בזהירות"
+    if score >= 40:
+        return "ניטרלית"
+    return "חלשה"
+
+
+def _parse_sector_scores(data: dict, ai_text: str) -> dict:
+    adjustments = {}
+    for line in ai_text.splitlines():
+        if not line.startswith("SCORE|"):
+            continue
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+        _marker, name, adjustment_text, reason = parts
+        name = name.strip()
+        if name not in data.get("sectors", {}):
+            continue
+        try:
+            adjustment = int(adjustment_text.strip())
+        except ValueError:
+            continue
+        adjustments[name] = {
+            "news_adjustment": int(_clamp(adjustment, -10, 10)),
+            "reason": reason.strip().replace("**", "")[:280],
+        }
+
+    scores = {}
+    for name, sector in data.get("sectors", {}).items():
+        graph_score = calculate_sector_graph_score(sector)
+        adjustment = adjustments.get(name, {}).get("news_adjustment", 0)
+        reason = adjustments.get(name, {}).get("reason") or (
+            "לא זוהתה בכותרות שסופקו השפעת חדשות ענפית מהותית; "
+            "הציון נשען על נתוני הגרף."
+        )
+        final_score = int(round(_clamp(graph_score + adjustment)))
+        scores[name] = {
+            "graph_score": graph_score,
+            "news_adjustment": adjustment,
+            "final_score": final_score,
+            "label": _sector_score_label(final_score),
+            "reason": reason,
+        }
+    return scores
+
+
+def _strip_score_protocol(ai_text: str) -> str:
+    return "\n".join(
+        line for line in ai_text.splitlines() if not line.startswith("SCORE|")
+    ).strip()
 
 
 def _format_number(value, decimals: int = 2) -> str:
@@ -152,6 +305,41 @@ def _format_pct(value) -> str:
         return f"{float(value):+.2f}%"
     except (TypeError, ValueError):
         return "לא זמין"
+
+
+def _format_market_date(value: str | None) -> str:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return "לא זמין"
+
+
+def _hebrew_count(value, singular: str, plural: str) -> str:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 0
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _market_close_notice(data: dict) -> str:
+    close_dates = {
+        name: _format_market_date(index.get("trend", {}).get("as_of"))
+        for name, index in data.get("indices", {}).items()
+        if name in {"ת״א-35", "ת״א-90", "ת״א-125"}
+    }
+    available_dates = {date for date in close_dates.values() if date != "לא זמין"}
+    if len(available_dates) == 1 and len(close_dates) == 3:
+        close_date = next(iter(available_dates))
+        return (
+            f"**מועד הסגירה:** כל מחירי המדדים בסעיף זה מתייחסים "
+            f"לסגירת המסחר ביום {close_date}."
+        )
+    details = "; ".join(
+        f"{name}: {close_dates.get(name, 'לא זמין')}"
+        for name in ("ת״א-35", "ת״א-90", "ת״א-125")
+    )
+    return f"**מועדי הסגירה של המדדים:** {details}."
 
 
 def _technical_summary(technical: dict, value_unit: str = "") -> list[str]:
@@ -208,26 +396,118 @@ def _technical_summary(technical: dict, value_unit: str = "") -> list[str]:
     ]
 
 
-def build_quantitative_cards(data: dict) -> str:
+def _sector_chart_summary(technical: dict) -> list[str]:
+    """Explain a sector chart in plain Hebrew without assuming TA knowledge."""
+    if not technical.get("available"):
+        return ["**מצב הנתונים:** נתוני הגרף אינם זמינים כעת."]
+
+    sessions = technical.get("sessions") or 0
+    close_date = _format_market_date(technical.get("as_of"))
+    period_note = (
+        f"{sessions} ימי מסחר, בקירוב שנת מסחר מלאה"
+        if sessions >= MIN_CHART_SESSIONS
+        else f"{sessions} ימי מסחר בלבד; לכן הביטחון במגמה ארוכת הטווח נמוך יותר"
+    )
+
+    average_states = []
+    period_names = {20: "טווח קצר", 50: "טווח בינוני", 200: "טווח ארוך"}
+    for period in (20, 50, 200):
+        state = technical.get(f"above_sma_{period}")
+        if state is not None:
+            average_states.append(
+                f"{period_names[period]}: {'מעל' if state else 'מתחת'} למחיר הממוצע"
+            )
+
+    rsi = technical.get("rsi_14")
+    if rsi is None:
+        strength_text = "עוצמת הקונים והמוכרים אינה זמינה"
+    elif rsi >= 70:
+        strength_text = "העלייה חזקה מאוד, ולכן גדל הסיכוי למימוש זמני"
+    elif rsi <= 30:
+        strength_text = "לחץ המכירות חזק; ייתכן ניסיון התאוששות, אך הוא עדיין לא מאושר"
+    else:
+        strength_text = "אין כרגע מצב קיצוני של קניות או מכירות"
+
+    macd = technical.get("macd_histogram")
+    momentum_text = (
+        "כיוון התנועה בטווח הקצר אינו זמין"
+        if macd is None
+        else (
+            "התנועה בטווח הקצר מתחזקת"
+            if macd > 0
+            else "התנועה בטווח הקצר נחלשת"
+            if macd < 0
+            else "התנועה בטווח הקצר יציבה"
+        )
+    )
+    turnover = technical.get("turnover_vs_20d_avg")
+    turnover_text = (
+        "היקף המסחר האחרון אינו זמין"
+        if turnover is None
+        else f"היקף המסחר האחרון היה פי {_format_number(turnover)} מהממוצע של 20 הימים האחרונים"
+    )
+
+    return [
+        f"**תקופת הגרף:** עד סגירת {close_date}; {period_note}.",
+        "**ביצועים:** חודש "
+        f"{_format_pct(technical.get('return_20d_pct'))}, שלושה חודשים "
+        f"{_format_pct(technical.get('return_3m_pct'))}, חצי שנה "
+        f"{_format_pct(technical.get('return_6m_pct'))}, שנה "
+        f"{_format_pct(technical.get('return_1y_pct'))}.",
+        f"**כיוון המגמה:** {technical.get('directional_bias') or 'לא זמין'}; "
+        f"{'; '.join(average_states) if average_states else 'השוואת המחיר הממוצע אינה זמינה'}.",
+        f"**עוצמת התנועה:** {strength_text}; {momentum_text}.",
+        "**רמות שכדאי לעקוב אחריהן:** אזור תמיכה, שבו ירידות נבלמו לאחרונה, "
+        f"בסביבות {_format_number(technical.get('support_60d'))}; אזור התנגדות, שבו עליות נבלמו, "
+        f"בסביבות {_format_number(technical.get('resistance_60d'))}. {turnover_text}.",
+    ]
+
+
+def build_quantitative_cards(
+    data: dict,
+    sector_scores: dict | None = None,
+) -> str:
     """Build complete Hebrew chart cards independently of AI output limits."""
+    sector_scores = sector_scores or _parse_sector_scores(data, "")
     sections = []
     for name in ("ת״א-35", "ת״א-90", "ת״א-125"):
         index = data.get("indices", {}).get(name, {})
         breadth = index.get("breadth", {})
+        close_date = _format_market_date(index.get("trend", {}).get("as_of"))
         lines = [
-            f"- **רמה אחרונה:** {_format_number(index.get('last_value'))}; שינוי יומי: {_format_pct(index.get('change_1d_pct'))}.",
-            f"- **רוחב השוק:** {breadth.get('advancers', 0)} עולות, {breadth.get('decliners', 0)} יורדות ו-{breadth.get('unchanged', 0)} ללא שינוי; משקל חמש הגדולות: {_format_number(index.get('top_5_weight_pct'))}%.",
+            f"- **נתוני הסגירה ליום {close_date}:** המדד ננעל ברמה {_format_number(index.get('last_value'))}; שינוי יומי: {_format_pct(index.get('change_1d_pct'))}.",
+            f"- **רוחב השוק:** {_hebrew_count(breadth.get('advancers'), 'עולה', 'עולות')}, "
+            f"{_hebrew_count(breadth.get('decliners'), 'יורדת', 'יורדות')} ו-"
+            f"{_hebrew_count(breadth.get('unchanged'), 'ללא שינוי', 'ללא שינוי')}; "
+            f"משקל חמש הגדולות: {_format_number(index.get('top_5_weight_pct'))}%.",
         ]
         lines.extend(f"- **תובנת גרף:** {line}" for line in _technical_summary(index.get("trend", {})))
         lines.append(f"- [הגרף הרשמי של {name}]({index.get('chart_source')})")
         sections.append(f"### מדד {name}\n" + "\n".join(lines))
 
+    if data.get("sectors"):
+        sections.append(
+            "### איך לקרוא את ציוני הסקטורים\n"
+            "- **מה הציון מודד:** אטרקטיביות יחסית להשקעה כעת, באופק של 2–6 שבועות ובגישה מאוזנת.\n"
+            "- **איך הוא מחושב:** ציון גרף של 0–100 המבוסס על תשואות, ממוצעי מחיר, רוחב, עוצמת התנועה ותנודתיות; ה-AI רשאי להוסיף או להפחית עד 10 נקודות רק בגלל חדשות ישראליות שסופקו למערכת.\n"
+            "- **פירוש מהיר:** 85–100 חזקה מאוד; 70–84 חזקה; 55–69 חיובית בזהירות; 40–54 ניטרלית; מתחת ל-40 חלשה.\n"
+            "- **חשוב:** זהו כלי השוואתי ולא הבטחת תשואה או המלצת השקעה אישית."
+        )
+
     for name, sector in data.get("sectors", {}).items():
         breadth = sector.get("breadth", {})
+        score = sector_scores[name]
         lines = [
-            f"- **מדד הסקטור:** רמה {_format_number(sector.get('last_value'))}; שינוי יומי {_format_pct(sector.get('change_1d_pct'))}; רוחב: {breadth.get('advancers', 0)} עולות, {breadth.get('decliners', 0)} יורדות ו-{breadth.get('unchanged', 0)} ללא שינוי.",
+            f"- **ציון אטרקטיביות להשקעה כעת: {score['final_score']}/100 – {score['label']}.** "
+            f"ציון הגרף: {score['graph_score']}/100; השפעת החדשות: {score['news_adjustment']:+d} נקודות. "
+            f"{score['reason']}",
+            f"- **מדד הסקטור:** רמה {_format_number(sector.get('last_value'))}; שינוי יומי {_format_pct(sector.get('change_1d_pct'))}; "
+            f"רוחב: {_hebrew_count(breadth.get('advancers'), 'עולה', 'עולות')}, "
+            f"{_hebrew_count(breadth.get('decliners'), 'יורדת', 'יורדות')} ו-"
+            f"{_hebrew_count(breadth.get('unchanged'), 'ללא שינוי', 'ללא שינוי')}.",
         ]
-        lines.extend(f"- **גרף הסקטור:** {line}" for line in _technical_summary(sector.get("trend", {})))
+        lines.append("#### קריאת גרף הסקטור במילים פשוטות")
+        lines.extend(f"- {line}" for line in _sector_chart_summary(sector.get("trend", {})))
         lines.append(f"- [הגרף הרשמי של סקטור {name}]({sector.get('chart_source')})")
         lines.append("#### שלוש המניות הגדולות לפי שווי שוק")
         for stock in sector.get("top_stocks_by_market_cap", []):
@@ -289,6 +569,8 @@ def validate_market_data(data: dict) -> None:
             problems.append(f"{name}: constituents missing")
         if (index.get("trend", {}).get("sessions") or 0) < MIN_CHART_SESSIONS:
             problems.append(f"{name}: one-year chart missing")
+        if not index.get("trend", {}).get("as_of"):
+            problems.append(f"{name}: closing date missing")
 
     for name, sector in data.get("sectors", {}).items():
         stocks = sector.get("top_stocks_by_market_cap", [])
@@ -356,14 +638,16 @@ def generate_hebrew_brief(data: dict) -> str:
 
     market_prompt = f"""אתה אנליסט הבורסה בתל אביב. כתוב בעברית תקנית וקצרה ל-{date_label}, על סמך הנתונים בלבד.
 
-כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, SMA-20/50/200, RSI-14, MACD, תמיכה/התנגדות, מחזור וקווי מגמה. bias הוא אינדיקציה בלבד.
+כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, לממוצעי המחיר, לעוצמת הקונים והמוכרים, לכיוון התנועה, לתמיכה ולהתנגדות. הנתונים הטכניים הם אינדיקציה בלבד.
 
-כתוב עד 300 מילים ובדיוק את הסעיפים הבאים:
+כתוב לקורא ללא רקע בניתוח טכני, עד 280 מילים ובדיוק את הסעיפים הבאים:
 ### תמונת מצב בבורסה בתל אביב
-סיכום הסגירה והמסר המרכזי.
+סיכום הסגירה והמסר המרכזי. אל תציין תאריך בעצמך; המערכת תוסיף את תאריך הסגירה הרשמי.
 
 ### מבט להמשך
-שתי פסקאות: "הימים הקרובים" (1–5 ימי מסחר) ו"השבועות הקרובים" (2–6 שבועות). בכל אחת: תרחיש בסיס, חיובי ושלילי, טריגר ואות ביטול, במילים פשוטות.
+חלק לשתי פסקאות: "הימים הקרובים" (1–5 ימי מסחר) ו"השבועות הקרובים" (2–6 שבועות). בכל פסקה השתמש בארבעה משפטים קצרים עם התוויות: **הכיוון הסביר**, **מה יכול לשפר את המצב**, **מה עלול להחליש את השוק**, **מתי נשנה את ההערכה**. הסבר את הסיבה במילים יומיומיות.
+
+אסור להשתמש בלי הסבר במילים טריגר, מומנטום, אישור, ביטול, שורי, דובי, RSI, MACD או SMA. אם חייבים לציין מדד טכני, כתוב קודם את המשמעות הפשוטה ורק אחר כך את שמו בסוגריים. לדוגמה: "המחיר נשאר מעל הממוצע של 50 הימים האחרונים (SMA-50)".
 
 מקרא: ret_1m_3m_6m_1y_pct=תשואות; above_sma_20_50_200=מיקום מעל הממוצעים; macd_hist=היסטוגרמת MACD; support_resistance_60d=תמיכה/התנגדות; turnover_x_avg20=מחזור יחסי; trendline_60d_200d_pct=קווי מגמה.
 
@@ -375,15 +659,25 @@ def generate_hebrew_brief(data: dict) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    sector_news = json.dumps(
+        _compact_sector_news(data),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     sector_prompt = f"""אתה אנליסט סקטורים של הבורסה בתל אביב. כתוב בעברית תקנית, קצרה וברורה.
 
-דרג את כל עשרת הסקטורים לפי שילוב של ביצועי חודש/3/6/12 חודשים, רוחב, תנודתיות, ממוצעים נעים, RSI, MACD וקווי מגמה. אל תסתמך על יום אחד ואל תמציא נתונים.
+לכל סקטור כבר חושב graph_score_0_100 שקוף לפי ביצועי חודש/3/6/12 חודשים, רוחב, תנודתיות, ממוצעי מחיר, RSI, MACD ומגמה. נתח את כותרות החדשות הישראליות שסופקו וקבע news_adjustment בין 10- ל-10+ בלבד. אם אין כותרת שקשורה ישירות לסקטור או לאחת המניות הגדולות בו, ההתאמה חייבת להיות 0. אל תשתמש בידע חיצוני ואל תמציא קשר סיבתי.
 
-כתוב עד 220 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
+בתחילת התשובה כתוב בדיוק עשר שורות מכונה, אחת לכל סקטור ובשמות שסופקו, בפורמט הבא וללא Markdown:
+SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10+|הסבר עברי קצר שמציין את החדשה או שאין חדשות מהותיות
+
+הציון הסופי הוא graph_score_0_100 ועוד התאמת החדשות, מוגבל ל-0–100. לאחר עשר שורות SCORE, דרג את הסקטורים לפי הציון הסופי.
+
+כתוב לאחר שורות המכונה עד 220 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
 ### סקטורים בולטים ותובנות AI
-- **מועדף – שם הסקטור:** משפט אחד עם תזה, סיכון, תנאי אישור וביטול.
-- **מעקב – שם הסקטור:** משפט אחד באותו מבנה.
-- **להמתין – שם הסקטור:** משפט אחד באותו מבנה.
+- **מועדף – שם הסקטור והציון:** משפט אחד עם הסבר פשוט, סיכון ומה ישנה את ההערכה.
+- **מעקב – שם הסקטור והציון:** משפט אחד באותו מבנה.
+- **להמתין – שם הסקטור והציון:** משפט אחד באותו מבנה.
 - **חלשים:** משפט אחד שמציין את הסקטורים החלשים והסיבה.
 
 ### מבט סקטוריאלי להמשך
@@ -394,20 +688,28 @@ def generate_hebrew_brief(data: dict) -> str:
 מקרא: ret_1m_3m_6m_1y_pct = תשואות חודש/3/6/12 חודשים; above_sma_20_50_200 = מעל ממוצעים 20/50/200; macd_hist = היסטוגרמת MACD; trendline_60d_200d_pct = קווי מגמה.
 
 נתונים:
-{sector_overview}"""
+סקטורים וגרפים: {sector_overview}
+חדשות שסופקו: {sector_news}"""
 
     market_brief = _groq_completion(
-        client, model, market_prompt, max_tokens=900, purpose="market"
+        client, model, market_prompt, max_tokens=1200, purpose="market"
     )
     _require_ai_sections(market_brief, ("תמונת מצב בבורסה בתל אביב", "מבט להמשך"))
-    sector_brief = _groq_completion(
-        client, model, sector_prompt, max_tokens=700, purpose="sectors"
+    market_brief = market_brief.replace(
+        "### תמונת מצב בבורסה בתל אביב",
+        "### תמונת מצב בבורסה בתל אביב\n" + _market_close_notice(data) + "\n",
+        1,
+    )
+    sector_brief_raw = _groq_completion(
+        client, model, sector_prompt, max_tokens=1100, purpose="sectors"
     )
     _require_ai_sections(
-        sector_brief,
+        sector_brief_raw,
         ("סקטורים בולטים ותובנות AI", "מבט סקטוריאלי להמשך"),
     )
-    quantitative_cards = build_quantitative_cards(data)
+    sector_scores = _parse_sector_scores(data, sector_brief_raw)
+    sector_brief = _strip_score_protocol(sector_brief_raw)
+    quantitative_cards = build_quantitative_cards(data, sector_scores)
     source_cards = build_source_context_cards(data)
     return "\n\n".join([market_brief, quantitative_cards, sector_brief, source_cards])
 

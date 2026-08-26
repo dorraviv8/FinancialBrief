@@ -1,894 +1,682 @@
 #!/usr/bin/env python3
-"""
-Financial Morning Brief Agent
-Collects financial data from multiple free sources and sends a Hebrew daily brief via email.
-"""
+"""Daily AI briefing focused exclusively on the Israeli stock market."""
 
-import os
+from __future__ import annotations
+
+import argparse
+import html
 import json
+import os
+import re
 import smtplib
-import requests
-import feedparser
-import yfinance as yf
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 from groq import Groq
-import re
+
 import database
+from israel_market import collect_israeli_market_data
+
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY")
-FRED_API_KEY      = os.getenv("FRED_API_KEY")
-FINNHUB_KEY       = os.getenv("FINNHUB_KEY")
-GMAIL_USER        = os.getenv("GMAIL_USER")
-GMAIL_APP_PASSWORD= os.getenv("GMAIL_APP_PASSWORD")
-OWNER_NAME        = os.getenv("OWNER_NAME", "Admin")
-OWNER_EMAIL       = os.getenv("OWNER_EMAIL")
-BASE_URL          = os.getenv("BASE_URL", "http://localhost:5000")
-
-TODAY          = datetime.now().strftime("%d/%m/%Y")
-TODAY_ISO      = datetime.now().strftime("%Y-%m-%d")
-TODAY_SHORT    = datetime.now().strftime("%d.%m")
-TOMORROW_SHORT = (datetime.now() + timedelta(days=1)).strftime("%d.%m")
-
-# ── Trading day awareness ─────────────────────────────────────────────────────
-# The brief runs at 07:00 Israel time. US markets close at ~midnight Israel time
-# (16:00 ET). Israeli markets close at ~17:15 Israel time.
-# At 07:00, NEITHER market is open — all data is from the previous session close.
-
-def _last_us_trading_day() -> datetime:
-    """Most recent day US markets (Mon-Fri) were open, as of 07:00 Israel time."""
-    wd = datetime.now().weekday()   # Mon=0 … Sun=6
-    if wd == 0: return datetime.now() - timedelta(days=3)   # Mon  → Fri
-    if wd == 5: return datetime.now() - timedelta(days=1)   # Sat  → Fri
-    if wd == 6: return datetime.now() - timedelta(days=2)   # Sun  → Fri
-    return datetime.now() - timedelta(days=1)               # Tue–Fri → yesterday
-
-def _last_il_trading_day() -> datetime:
-    """Most recent day Israeli markets (Sun-Thu) were open, as of 07:00 Israel time."""
-    wd = datetime.now().weekday()
-    if wd == 4: return datetime.now() - timedelta(days=1)   # Fri  → Thu
-    if wd == 5: return datetime.now() - timedelta(days=2)   # Sat  → Thu
-    if wd == 6: return datetime.now() - timedelta(days=3)   # Sun  → Thu
-    return datetime.now() - timedelta(days=1)               # Mon–Thu → yesterday
-
-_HE_DAYS = {0: "יום שני", 1: "יום שלישי", 2: "יום רביעי",
-            3: "יום חמישי", 4: "יום שישי", 5: "שבת", 6: "יום ראשון"}
-
-LAST_US_CLOSE    = _last_us_trading_day().strftime("%d.%m")
-LAST_IL_CLOSE    = _last_il_trading_day().strftime("%d.%m")
-LAST_US_DAY_HE   = _HE_DAYS[_last_us_trading_day().weekday()]
-LAST_IL_DAY_HE   = _HE_DAYS[_last_il_trading_day().weekday()]
-IL_OPEN_TODAY    = datetime.now().weekday() in [0, 1, 2, 3, 6]   # Sun–Thu
-US_OPEN_TODAY    = datetime.now().weekday() in [0, 1, 2, 3, 4]   # Mon–Fri
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "90"))
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+OWNER_NAME = os.getenv("OWNER_NAME", "Admin")
+OWNER_EMAIL = os.getenv("OWNER_EMAIL")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5000")
+MIN_CHART_SESSIONS = 200
+MIN_STOCK_CHART_SESSIONS = 20
 
 
-# ── 1. Market Snapshot (yfinance) ─────────────────────────────────────────────
-def get_market_snapshot():
-    """Fetch key indices, futures, and currencies."""
-    tickers = {
-        "SPY (S&P 500)":  "SPY",
-        "QQQ (Nasdaq)":   "QQQ",
-        "Dow Jones":      "^DJI",
-        "Russell 2000":   "^RUT",
-        "VIX":            "^VIX",
-        "S&P500 Futures": "ES=F",
-        "Nasdaq Futures": "NQ=F",
-        "USD/ILS":        "ILS=X",
-        "EUR/ILS":        "EURILS=X",
-        "EUR/USD":        "EURUSD=X",
-        "Gold":           "GC=F",
-        "Oil (WTI)":      "CL=F",
-        "Bitcoin":        "BTC-USD",
-        "Ethereum":       "ETH-USD",
+def _today() -> datetime:
+    return datetime.now(ISRAEL_TZ)
+
+
+def _compact_technical(technical: dict | None) -> dict:
+    technical = technical or {}
+    if not technical.get("available"):
+        return {"ok": False}
+    return {
+        "ok": True,
+        "n": technical.get("sessions"),
+        "date": technical.get("as_of"),
+        "ret_1m_3m_6m_1y_pct": [
+            technical.get("return_20d_pct"),
+            technical.get("return_3m_pct"),
+            technical.get("return_6m_pct"),
+            technical.get("return_1y_pct"),
+        ],
+        "above_sma_20_50_200": [
+            technical.get("above_sma_20"),
+            technical.get("above_sma_50"),
+            technical.get("above_sma_200"),
+        ],
+        "rsi14": technical.get("rsi_14"),
+        "macd_hist": technical.get("macd_histogram"),
+        "support_resistance_60d": [
+            technical.get("support_60d"),
+            technical.get("resistance_60d"),
+        ],
+        "turnover_x_avg20": technical.get("turnover_vs_20d_avg"),
+        "trendline_60d_200d_pct": [
+            technical.get("trendline_60d_pct"),
+            technical.get("trendline_200d_pct"),
+        ],
+        "ann_vol_pct": technical.get("annualized_volatility_pct"),
+        "bias": technical.get("directional_bias"),
     }
-    results = {}
-    for name, symbol in tickers.items():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="2d")
-            if len(hist) >= 2:
-                prev_close = hist["Close"].iloc[-2]
-                last_price = hist["Close"].iloc[-1]
-                change_pct = ((last_price - prev_close) / prev_close) * 100
-                results[name] = {
-                    "price": round(float(last_price), 2),
-                    "change_pct": round(float(change_pct), 2),
-                    "arrow": "▲" if change_pct >= 0 else "▼"
-                }
-            elif len(hist) == 1:
-                results[name] = {
-                    "price": round(float(hist["Close"].iloc[-1]), 2),
-                    "change_pct": 0.0,
-                    "arrow": "–"
-                }
-        except Exception:
-            results[name] = {"price": "N/A", "change_pct": 0.0, "arrow": "–"}
-    return results
 
 
-# ── 2. Global Markets (yfinance) ──────────────────────────────────────────────
-def get_global_markets():
-    """Fetch major global indices."""
-    global_tickers = {
-        "FTSE 100 (לונדון)":    "^FTSE",
-        "DAX (גרמניה)":          "^GDAXI",
-        "CAC 40 (צרפת)":         "^FCHI",
-        "Nikkei 225 (יפן)":      "^N225",
-        "Hang Seng (הונג קונג)": "^HSI",
-        "Shanghai (סין)":        "000001.SS",
-        "TA-125 (תל אביב)":      "^TA125.TA",
-    }
-    results = {}
-    for name, symbol in global_tickers.items():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="2d")
-            if len(hist) >= 2:
-                prev_close = hist["Close"].iloc[-2]
-                last_price = hist["Close"].iloc[-1]
-                change_pct = ((last_price - prev_close) / prev_close) * 100
-                results[name] = {
-                    "price": round(float(last_price), 2),
-                    "change_pct": round(float(change_pct), 2),
-                    "arrow": "▲" if change_pct >= 0 else "▼"
-                }
-        except Exception:
-            results[name] = {"price": "N/A", "change_pct": 0.0, "arrow": "–"}
-    return results
-
-
-# ── 2b. TASE Trending Stocks (yfinance) ──────────────────────────────────────
-def get_tase_stocks():
-    """Fetch key Israeli stocks from Tel Aviv Stock Exchange."""
-    tase_tickers = {
-        "טבע":          "TEVA.TA",
-        "נייס סיסטמס":  "NICE.TA",
-        "ICL":          "ICL.TA",
-        "אלביט מערכות": "ESLT.TA",
-        "בנק הפועלים":  "POLI.TA",
-        "בנק לאומי":    "LUMI.TA",
-        "מזרחי טפחות":  "MZTF.TA",
-        "שופרסל":       "SAE.TA",
-        "ביג":          "BIG.TA",
-    }
-    results = {}
-    for name, symbol in tase_tickers.items():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="2d")
-            if len(hist) >= 2:
-                prev = hist["Close"].iloc[-2]
-                last = hist["Close"].iloc[-1]
-                chg  = ((last - prev) / prev) * 100
-                results[name] = {
-                    "symbol": symbol.replace(".TA", ""),
-                    "price": round(float(last), 2),
-                    "change_pct": round(float(chg), 2),
-                    "arrow": "▲" if chg >= 0 else "▼"
-                }
-        except Exception:
-            pass
-    return results
-
-
-# ── 3. Treasury Yields (yfinance) ─────────────────────────────────────────────
-def get_treasury_yields():
-    """Fetch US Treasury yields."""
-    yields = {
-        "2Y":  "^IRX",
-        "10Y": "^TNX",
-        "30Y": "^TYX",
-    }
-    results = {}
-    for name, symbol in yields.items():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="2d")
-            if len(hist) >= 1:
-                results[name] = round(float(hist["Close"].iloc[-1]), 3)
-        except Exception:
-            results[name] = "N/A"
-    return results
-
-
-# ── 4. Top Movers (Yahoo Finance screener – real-time ranked list) ─────────────
-def normalize_sp500_symbol(symbol: str) -> str:
-    """Normalize symbols to Yahoo format for S&P 500 membership checks."""
-    return str(symbol or "").strip().upper().replace(".", "-")
-
-
-def get_sp500_symbols():
-    """Fetch S&P 500 tickers from Wikipedia. Return empty set if unavailable."""
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        symbols = tables[0]["Symbol"].dropna().tolist()
-        return {normalize_sp500_symbol(symbol) for symbol in symbols}
-    except Exception:
-        return set()
-
-
-def filter_sp500_quotes(quotes, sp500_symbols, limit=5):
-    """Return only quotes whose symbols are S&P 500 constituents."""
-    if not sp500_symbols:
-        return []
-
-    filtered = []
-    for q in quotes:
-        symbol = normalize_sp500_symbol(q.get("symbol", ""))
-        if symbol not in sp500_symbols:
-            continue
-        filtered.append({
-            "name":       q.get("shortName") or q.get("longName") or symbol,
-            "symbol":     symbol,
-            "price":      round(float(q.get("regularMarketPrice", 0)), 2),
-            "change_pct": round(float(q.get("regularMarketChangePercent", 0)), 2),
-        })
-        if len(filtered) >= limit:
-            break
-    return filtered
-
-
-def get_top_movers():
-    """Fetch S&P 500 gainers and losers from Yahoo Finance screener."""
-    headers = {"User-Agent": "Mozilla/5.0"}
-    base = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
-    params = {"formatted": "false", "count": "50"}
-    sp500_symbols = get_sp500_symbols()
-    if not sp500_symbols:
-        return {"gainers": [], "losers": []}
-
-    def fetch(screen_id):
-        try:
-            r = requests.get(base, params={**params, "scrIds": screen_id}, headers=headers, timeout=10)
-            r.raise_for_status()
-            quotes = r.json()["finance"]["result"][0]["quotes"]
-            return filter_sp500_quotes(quotes, sp500_symbols)
-        except Exception:
-            return []
-
-    return {"gainers": fetch("day_gainers"), "losers": fetch("day_losers")}
-
-
-# ── 5. Sector Performance (yfinance ETFs) ─────────────────────────────────────
-def get_sector_performance():
-    """Fetch sector ETF performance as proxy for sector rotation."""
-    sectors = {
-        "טכנולוגיה":       "XLK",
-        "בריאות":           "XLV",
-        "פיננסים":          "XLF",
-        "אנרגיה":           "XLE",
-        "צרכנות בסיסית":   "XLP",
-        "צרכנות שיקולית":  "XLY",
-        "תעשייה":           "XLI",
-        'נדל"ן':            "XLRE",
-        "תקשורת":           "XLC",
-        "חומרים":           "XLB",
-        "תשתיות":           "XLU",
-    }
-    results = {}
-    for name, symbol in sectors.items():
-        try:
-            t = yf.Ticker(symbol)
-            hist = t.history(period="2d")
-            if len(hist) >= 2:
-                prev = hist["Close"].iloc[-2]
-                last = hist["Close"].iloc[-1]
-                chg  = ((last - prev) / prev) * 100
-                results[name] = {"symbol": symbol, "change_pct": round(float(chg), 2), "arrow": "▲" if chg >= 0 else "▼"}
-        except Exception:
-            pass
-    return results
-
-
-# ── 6. Fear & Greed Index (CNN) ───────────────────────────────────────────────
-def get_fear_greed():
-    """Fetch Fear & Greed Index — tries CNN then falls back to VIX-based estimate."""
-    translations = {
-        "Extreme Fear":  "פחד קיצוני",
-        "Fear":          "פחד",
-        "Neutral":       "ניטרלי",
-        "Greed":         "חמדנות",
-        "Extreme Greed": "חמדנות קיצונית",
-    }
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Accept": "application/json",
+def _compact_market_payload(data: dict) -> dict:
+    indices = {}
+    for name, index in data.get("indices", {}).items():
+        indices[name] = {
+            "last_value": index.get("last_value"),
+            "change_1d_pct": index.get("change_1d_pct"),
+            "breadth": index.get("breadth"),
+            "top_5_weight_pct": index.get("top_5_weight_pct"),
+            "trend": _compact_technical(index.get("trend")),
         }
-        r = requests.get(
-            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
-            headers=headers, timeout=10
-        )
-        data = r.json()
-        if "fear_and_greed" in data:
-            score  = float(data["fear_and_greed"]["score"])
-            rating = data["fear_and_greed"]["rating"]
-            return {"score": round(score, 1), "rating": translations.get(rating, rating), "source": "CNN"}
-    except Exception:
-        pass
-    # Fallback: derive sentiment from VIX
+    return {
+        "as_of": data.get("as_of"),
+        "indices": indices,
+    }
+
+
+def _compact_sector_payload(data: dict, selected_names: list[str] | None = None) -> dict:
+    sectors = {}
+    for name, sector in data.get("sectors", {}).items():
+        if selected_names is not None and name not in selected_names:
+            continue
+        stocks = []
+        for stock in sector.get("top_stocks_by_market_cap", []):
+            stocks.append({
+                "name": stock.get("name"),
+                "symbol": stock.get("symbol"),
+                "security_number": stock.get("security_number"),
+                "price_ils": stock.get("price_ils"),
+                "change_1d_pct": stock.get("change_1d_pct"),
+                "market_cap_m_ils": stock.get("market_cap_m_ils"),
+                "index_weight_pct": stock.get("index_weight_pct"),
+                "technical": _compact_technical(stock.get("technical_analysis")),
+                "chart_source": stock.get("chart_source"),
+            })
+        sectors[name] = {
+            "index_id": sector.get("index_id"),
+            "last_value": sector.get("last_value"),
+            "change_1d_pct": sector.get("change_1d_pct"),
+            "constituents_count": sector.get("constituents_count"),
+            "breadth": sector.get("breadth"),
+            "trend": _compact_technical(sector.get("trend")),
+            "top_stocks_by_market_cap": stocks,
+            "source": sector.get("source"),
+        }
+    return {
+        "as_of": data.get("as_of"),
+        "horizon": "מספר שבועות, לפחות 15 ימי מסחר",
+        "sectors": sectors,
+    }
+
+
+def _compact_sector_overview(data: dict) -> dict:
+    return {
+        "as_of": data.get("as_of"),
+        "sectors": {
+            name: {
+                "change_1d_pct": sector.get("change_1d_pct"),
+                "breadth": sector.get("breadth"),
+                "trend": _compact_technical(sector.get("trend")),
+            }
+            for name, sector in data.get("sectors", {}).items()
+        },
+    }
+
+
+def _format_number(value, decimals: int = 2) -> str:
     try:
-        vix = float(yf.Ticker("^VIX").history(period="1d")["Close"].iloc[-1])
-        if vix < 12:   score, rating = 82, "חמדנות קיצונית"
-        elif vix < 16: score, rating = 65, "חמדנות"
-        elif vix < 20: score, rating = 50, "ניטרלי"
-        elif vix < 28: score, rating = 32, "פחד"
-        else:          score, rating = 14, "פחד קיצוני"
-        return {"score": score, "rating": rating, "source": f"VIX={round(vix,1)} (אומדן)"}
-    except Exception:
-        return {"score": "N/A", "rating": "לא זמין"}
+        return f"{float(value):,.{decimals}f}"
+    except (TypeError, ValueError):
+        return "לא זמין"
 
 
-# ── 7. Financial News (RSS Feeds) ─────────────────────────────────────────────
-def get_news_rss():
-    """Fetch headlines from financial AND world/geopolitical RSS feeds.
-    World news gives the AI raw material to connect global events to markets.
-    """
-    financial_feeds = [
-        ("Reuters Finance",     "https://feeds.reuters.com/reuters/businessNews"),
-        ("CNBC",                "https://www.cnbc.com/id/10000664/device/rss/rss.html"),
-        ("MarketWatch",         "https://feeds.marketwatch.com/marketwatch/topstories/"),
-        ("Yahoo Finance",       "https://finance.yahoo.com/news/rssindex"),
-        ("Calcalist (כלכליסט)", "https://www.calcalist.co.il/rss/"),
-        ("Globes (גלובס)",      "https://www.globes.co.il/webservice/rss/rssfeeder.asmx/FeederNode?iID=1"),
-    ]
-    world_feeds = [
-        ("Reuters World",   "https://feeds.reuters.com/Reuters/worldNews"),
-        ("BBC World",       "http://feeds.bbci.co.uk/news/world/rss.xml"),
-        ("AP News",         "https://feeds.apnews.com/apnews/topnews"),
-        ("Times of Israel", "https://www.timesofisrael.com/feed/"),
-    ]
+def _format_pct(value) -> str:
+    try:
+        return f"{float(value):+.2f}%"
+    except (TypeError, ValueError):
+        return "לא זמין"
 
-    cutoff = datetime.now() - timedelta(hours=48)
 
-    def fetch(source, url, max_entries):
-        items = []
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries:
-                title = entry.get("title", "").strip()
-                if not title:
-                    continue
-                # Filter by publish date — skip anything older than 48 hours
-                pub = entry.get("published_parsed") or entry.get("updated_parsed")
-                if pub:
-                    try:
-                        pub_dt = datetime(*pub[:6])
-                        if pub_dt < cutoff:
-                            continue
-                        pub_str = pub_dt.strftime("%d/%m/%Y %H:%M")
-                    except Exception:
-                        pub_str = "תאריך לא ידוע"
-                else:
-                    # No date metadata — include but flag it
-                    pub_str = "תאריך לא ידוע"
-                items.append({
-                    "source": source,
-                    "title": title,
-                    "published": pub_str,
-                    "link": entry.get("link", url),
-                })
-                if len(items) >= max_entries:
-                    break
-        except Exception:
-            pass
-        return items
-
-    financial = []
-    for source, url in financial_feeds:
-        financial.extend(fetch(source, url, 2))
-
-    world = []
-    for source, url in world_feeds:
-        world.extend(fetch(source, url, 2))
-
-    return (
-        [{"category": "finance", **h} for h in financial[:8]] +
-        [{"category": "world",   **h} for h in world[:6]]
+def _technical_summary(technical: dict, value_unit: str = "") -> list[str]:
+    if not technical.get("available"):
+        return ["נתוני הגרף אינם זמינים כעת."]
+    sessions = technical.get("sessions") or 0
+    history_note = (
+        f"הניתוח מבוסס על {sessions} ימי מסחר בחלון של שנה."
+        if sessions >= MIN_CHART_SESSIONS
+        else f"קיימים רק {sessions} ימי מסחר מקומיים; אין להסיק מכך מגמה שנתית מלאה."
     )
+    sma_labels = []
+    for period in (20, 50, 200):
+        state = technical.get(f"above_sma_{period}")
+        if state is not None:
+            sma_labels.append(f"{'מעל' if state else 'מתחת'} SMA-{period}")
+    rsi = technical.get("rsi_14")
+    if rsi is None:
+        rsi_text = "RSI-14 לא זמין"
+    elif rsi >= 70:
+        rsi_text = f"RSI-14 {_format_number(rsi, 1)} – קניית יתר"
+    elif rsi <= 30:
+        rsi_text = f"RSI-14 {_format_number(rsi, 1)} – מכירת יתר"
+    else:
+        rsi_text = f"RSI-14 {_format_number(rsi, 1)} – תחום ניטרלי"
+    macd = technical.get("macd_histogram")
+    macd_text = (
+        "MACD לא זמין"
+        if macd is None
+        else f"MACD {'חיובי' if macd > 0 else 'שלילי' if macd < 0 else 'ניטרלי'} ({_format_number(macd, 3)})"
+    )
+    unit = f" {value_unit}" if value_unit else ""
+    support = _format_number(technical.get("support_60d"))
+    resistance = _format_number(technical.get("resistance_60d"))
+    turnover = technical.get("turnover_vs_20d_avg")
+    turnover_text = (
+        "נתון מחזור אינו זמין"
+        if turnover is None
+        else f"המחזור האחרון הוא פי {_format_number(turnover)} מממוצע 20 הימים"
+    )
+    return [
+        history_note,
+        "תשואות חודש / 3 חודשים / 6 חודשים / שנה: "
+        + " / ".join(
+            _format_pct(technical.get(key))
+            for key in ("return_20d_pct", "return_3m_pct", "return_6m_pct", "return_1y_pct")
+        )
+        + ".",
+        f"ממוצעים נעים: {', '.join(sma_labels) if sma_labels else 'לא זמינים'}; {rsi_text}; {macd_text}.",
+        f"תמיכה ל-60 יום: {support}{unit}; התנגדות: {resistance}{unit}; {turnover_text}.",
+        "קווי מגמה ל-60 / 200 ימים: "
+        f"{_format_pct(technical.get('trendline_60d_pct'))} / {_format_pct(technical.get('trendline_200d_pct'))}; "
+        f"הטיה כמותית: {technical.get('directional_bias') or 'לא זמינה'}.",
+    ]
 
 
-# ── 8. Finnhub – Earnings Calendar ────────────────────────────────────────────
-def get_earnings_today():
-    """Fetch today's earnings releases from Finnhub."""
-    if not FINNHUB_KEY:
-        return []
-    try:
-        url = (f"https://finnhub.io/api/v1/calendar/earnings"
-               f"?from={TODAY_ISO}&to={TODAY_ISO}&token={FINNHUB_KEY}")
-        r    = requests.get(url, timeout=10)
-        data = r.json()
-        return [
-            {"symbol": e.get("symbol", ""), "estimate": e.get("epsEstimate", "N/A")}
-            for e in data.get("earningsCalendar", [])[:10]
+def build_quantitative_cards(data: dict) -> str:
+    """Build complete Hebrew chart cards independently of AI output limits."""
+    sections = []
+    for name in ("ת״א-35", "ת״א-90", "ת״א-125"):
+        index = data.get("indices", {}).get(name, {})
+        breadth = index.get("breadth", {})
+        lines = [
+            f"- **רמה אחרונה:** {_format_number(index.get('last_value'))}; שינוי יומי: {_format_pct(index.get('change_1d_pct'))}.",
+            f"- **רוחב השוק:** {breadth.get('advancers', 0)} עולות, {breadth.get('decliners', 0)} יורדות ו-{breadth.get('unchanged', 0)} ללא שינוי; משקל חמש הגדולות: {_format_number(index.get('top_5_weight_pct'))}%.",
         ]
-    except Exception:
-        return []
+        lines.extend(f"- **תובנת גרף:** {line}" for line in _technical_summary(index.get("trend", {})))
+        lines.append(f"- [הגרף הרשמי של {name}]({index.get('chart_source')})")
+        sections.append(f"### מדד {name}\n" + "\n".join(lines))
+
+    for name, sector in data.get("sectors", {}).items():
+        breadth = sector.get("breadth", {})
+        lines = [
+            f"- **מדד הסקטור:** רמה {_format_number(sector.get('last_value'))}; שינוי יומי {_format_pct(sector.get('change_1d_pct'))}; רוחב: {breadth.get('advancers', 0)} עולות, {breadth.get('decliners', 0)} יורדות ו-{breadth.get('unchanged', 0)} ללא שינוי.",
+        ]
+        lines.extend(f"- **גרף הסקטור:** {line}" for line in _technical_summary(sector.get("trend", {})))
+        lines.append(f"- [הגרף הרשמי של סקטור {name}]({sector.get('chart_source')})")
+        lines.append("#### שלוש המניות הגדולות לפי שווי שוק")
+        for stock in sector.get("top_stocks_by_market_cap", []):
+            technical = stock.get("technical_analysis", {})
+            chart_points = _technical_summary(technical, value_unit="₪")
+            concise_chart = (
+                " ".join((chart_points[1], chart_points[2], chart_points[3], chart_points[4]))
+                if technical.get("available")
+                else chart_points[0]
+            )
+            if technical.get("available") and (technical.get("sessions") or 0) < MIN_CHART_SESSIONS:
+                concise_chart = f"{chart_points[0]} {concise_chart}"
+            lines.append(
+                f"- **{stock.get('name')} ({stock.get('symbol')})** – מחיר {_format_number(stock.get('price_ils'))} ₪; "
+                f"שינוי יומי {_format_pct(stock.get('change_1d_pct'))}; שווי שוק {_format_number(stock.get('market_cap_m_ils'), 0)} מיליון ₪. "
+                f"{concise_chart} [גרף רשמי]({stock.get('chart_source')})"
+            )
+        sections.append(f"### סקטור: {name}\n" + "\n".join(lines))
+    return "\n\n".join(sections)
 
 
-# ── 9. FRED – Economic Indicators ─────────────────────────────────────────────
-def get_fred_indicators():
-    """Fetch key macro indicators from FRED."""
-    if not FRED_API_KEY:
-        return {}
-    series = {
-        "אינפלציה (CPI שנתי)": "CPIAUCSL",
-        "ריבית פד":             "FEDFUNDS",
-        "אבטלה":                "UNRATE",
-        "GDP צמיחה":            "A191RL1Q225SBEA",
-    }
-    results = {}
-    for name, series_id in series.items():
-        try:
-            url = (f"https://api.stlouisfed.org/fred/series/observations"
-                   f"?series_id={series_id}&api_key={FRED_API_KEY}"
-                   f"&sort_order=desc&limit=2&file_type=json")
-            r   = requests.get(url, timeout=10)
-            obs = r.json().get("observations", [])
-            if obs:
-                results[name] = {
-                    "latest": obs[0].get("value", "N/A"),
-                    "prev":   obs[1].get("value", "N/A") if len(obs) > 1 else "N/A"
-                }
-        except Exception:
-            pass
-    return results
-
-
-# ── 10. Alpha Vantage – Market Movers ─────────────────────────────────────────
-def get_alpha_vantage_movers():
-    """Fetch market movers from Alpha Vantage."""
-    if not ALPHA_VANTAGE_KEY:
-        return {}
-    try:
-        url  = f"https://www.alphavantage.co/query?function=TOP_GAINERS_LOSERS&apikey={ALPHA_VANTAGE_KEY}"
-        r    = requests.get(url, timeout=10)
-        data = r.json()
-        return {
-            "gainers": [{"symbol": x.get("ticker"), "change_pct": x.get("change_percentage")}
-                        for x in data.get("top_gainers", [])[:5]],
-            "losers":  [{"symbol": x.get("ticker"), "change_pct": x.get("change_percentage")}
-                        for x in data.get("top_losers", [])[:5]],
-        }
-    except Exception:
-        return {}
-
-
-# ── 11a. Trend Summary from stored snapshots ──────────────────────────────────
-def build_trend_summary() -> str:
-    """Build a compact time-series summary from yesterday's 5 snapshots.
-    Gives Groq a picture of how markets evolved throughout the day,
-    not just a single end-of-day snapshot.
-    """
-    snapshots = database.get_snapshots_last_24h()
-    if not snapshots:
-        return ""
-
-    lines = ["=== מגמות שוק לאורך יום המסחר האחרון ==="]
-    for snap in snapshots:
-        try:
-            dt_utc = datetime.fromisoformat(snap["time"])
-            dt_il  = dt_utc + timedelta(hours=3)   # UTC → Israel (IDT)
-            t      = dt_il.strftime("%H:%M")
-        except Exception:
-            t = snap["time"][:16]
-
-        d   = snap["data"]
-        spy = d.get("market", {}).get("SPY (S&P 500)", {})
-        qqq = d.get("market", {}).get("QQQ (Nasdaq)", {})
-        vix = d.get("market", {}).get("VIX", {})
-        ta  = d.get("global",  {}).get("TA-125 (תל אביב)", {})
-        fg  = d.get("fear_greed", {})
-        oil = d.get("market", {}).get("Oil (WTI)", {})
-
-        lines.append(
-            f"{t}: SPY {spy.get('price','?')} ({spy.get('arrow','')} {spy.get('change_pct','?')}%) | "
-            f"QQQ {qqq.get('price','?')} ({qqq.get('arrow','')} {qqq.get('change_pct','?')}%) | "
-            f"VIX {vix.get('price','?')} | "
-            f"ת\"א-125 {ta.get('price','?')} ({ta.get('arrow','')} {ta.get('change_pct','?')}%) | "
-            f"נפט {oil.get('price','?')} | "
-            f"סנטימנט: {fg.get('rating','?')} ({fg.get('score','?')})"
+def build_source_context_cards(data: dict) -> str:
+    """Render official macro, MAYA and Israeli-news source cards completely."""
+    rates = data.get("exchange_rates", {}).get("rates", {})
+    macro_lines = []
+    for currency in ("USD", "EUR", "GBP"):
+        rate = rates.get(currency, {})
+        macro_lines.append(
+            f"- **{currency}/ILS:** {_format_number(rate.get('ils_rate'), 4)}; שינוי {_format_pct(rate.get('change_pct'))}."
         )
-
-    return "\n".join(lines)
-
-
-# ── 11b. AI Analysis (Groq – two-call split) ──────────────────────────────────
-def build_currencies_commodities(market):
-    """Prepare the required rates section with day-over-day changes."""
-    keys = ["USD/ILS", "EUR/ILS", "Bitcoin", "Ethereum", "Gold", "Oil (WTI)"]
-    return {key: market[key] for key in keys if key in market}
-
-
-def generate_hebrew_brief(market, global_mkts, yields, movers, sectors, fear_greed, news, earnings, fred, tase_stocks):
-    """Generate the Hebrew brief using two Groq calls to stay under the 12k TPM limit.
-    Call 1: US markets, global, macro, sectors, movers, news, conclusions.
-    Call 2: Israeli market only.
-    Results are stitched together into one brief before sending.
-    """
-    client = Groq(api_key=GROQ_API_KEY)
-
-    # Split news by category and source
-    israeli_sources = {"Calcalist (כלכליסט)", "Globes (גלובס)"}
-    news_israel  = [n for n in news if n["source"] in israeli_sources][:5]
-    news_finance = [n for n in news if n.get("category") == "finance" and n["source"] not in israeli_sources][:6]
-    news_world   = [n for n in news if n.get("category") == "world"][:6]
-
-    # ── Call 1: US & Global (all sections except Israeli market) ─────────────
-    trend_summary = build_trend_summary()
-    currencies_commodities = build_currencies_commodities(market)
-
-    data_us = (
-        (f"{trend_summary}\n\n" if trend_summary else "") +
-        f"שווקים אמריקאים: {json.dumps(market, ensure_ascii=False)}\n"
-        f"מטבעות וסחורות: {json.dumps(currencies_commodities, ensure_ascii=False)}\n"
-        f"שווקים גלובליים: {json.dumps(global_mkts, ensure_ascii=False)}\n"
-        f"תשואות אג\"ח: {json.dumps(yields, ensure_ascii=False)}\n"
-        f"סקטורים: {json.dumps(sectors, ensure_ascii=False)}\n"
-        f"פחד ותאוות בצע: {json.dumps(fear_greed, ensure_ascii=False)}\n"
-        f"עולי/יורדי שער: {json.dumps(movers, ensure_ascii=False)}\n"
-        f"רווחים היום: {json.dumps(earnings, ensure_ascii=False)}\n"
-        f"מאקרו FRED: {json.dumps(fred, ensure_ascii=False)}\n"
-        f"כותרות פיננסיות: {json.dumps(news_finance, ensure_ascii=False)}\n"
-        f"אירועים עולמיים: {json.dumps(news_world, ensure_ascii=False)}"
+    macro_lines.append(
+        f"- [מקור: בנק ישראל]({data.get('exchange_rates', {}).get('source')})"
     )
 
-    il_status   = f"השוק הישראלי {'פתוח' if IL_OPEN_TODAY else 'סגור'} היום, {TODAY_SHORT}"
-    us_status   = f"השוק האמריקאי {'ייפתח היום, ' + TODAY_SHORT + ' בשעה 16:30' if US_OPEN_TODAY else 'סגור היום, ' + TODAY_SHORT}"
+    disclosure_lines = []
+    for item in data.get("maya_announcements", [])[:5]:
+        disclosure_lines.append(
+            f"- **{item.get('source')}:** [{item.get('title')}]({item.get('link')})"
+        )
+    for item in data.get("news", [])[:10]:
+        disclosure_lines.append(
+            f"- **{item.get('source')}:** [{item.get('title')}]({item.get('link')})"
+        )
+    if not disclosure_lines:
+        disclosure_lines.append("- לא נמצאו כותרות עדכניות בחלון האיסוף.")
 
-    prompt_us = f"""אתה אנליסט פיננסי בכיר ומומחה מאקרו-כלכלי. כתוב בריפינג בוקר **בעברית בלבד**, טרמינולוגיה כמו בכלכליסט/גלובס.
-כל סעיף מתחיל ב-### ואחריו שם הסעיף. SPY=מדד S&P 500, QQQ=מדד נאסד"ק 100.
+    return "\n\n".join((
+        "### מאקרו ישראלי ושער השקל\n" + "\n".join(macro_lines),
+        "### דיווחי מאיה וחדשות מהותיות\n" + "\n".join(disclosure_lines),
+    ))
 
-== חוקי תוכן — חובה לפעול לפיהם ==
-• כתוב **רק** על אירועים שמופיעים במפורש בנתונים שסופקו להלן.
-• **אסור** להזכיר אירועים היסטוריים מהידע הכללי שלך — אין COVID-19, אין ברקזיט, אין משברים ישנים שאינם בנתונים.
-• אם כותרת חדשה מסומנת "תאריך לא ידוע" — השתמש בה בזהירות בלבד ואל תניח שהיא עדכנית.
-• אם אין מספיק חדשות על נושא מסוים — דלג עליו לחלוטין. עדיף פחות תוכן ממידע לא מדויק.
-• ההתייחסות לאירועים תהיה רק מה-7 ימים האחרונים לכל היותר.
 
-== חוקי זמן — חובה לפעול לפיהם ==
-הבריפינג נשלח ב-{TODAY_SHORT} בשעה 07:00 בישראל. בשעה זו המסחר טרם נפתח.
-• נתוני ארה"ב הם ממחירי הסגירה של {LAST_US_DAY_HE}, {LAST_US_CLOSE} — כתוב "בסגירת {LAST_US_CLOSE}" או "בסגירת {LAST_US_DAY_HE}" ולא "היום"
-• נתוני ישראל הם ממחירי הסגירה של {LAST_IL_DAY_HE}, {LAST_IL_CLOSE} — כתוב "בסגירת {LAST_IL_CLOSE}" ולא "היום"
-• {il_status}
-• {us_status}
-• אסור לכתוב "השוק עלה היום" — כתוב "בסגירה האחרונה עלה" / "ב-{LAST_US_CLOSE} עלה"
-• המילה "היום" מותרת רק בהקשר עתידי ברור (מה צפוי לקרות ב-{TODAY_SHORT})
-• "מחר" = {TOMORROW_SHORT}
+def validate_market_data(data: dict) -> None:
+    """Refuse to generate or send a briefing from partial critical market data."""
+    problems = []
+    for name in ("ת״א-35", "ת״א-90", "ת״א-125"):
+        index = data.get("indices", {}).get(name, {})
+        if not index.get("constituents_count"):
+            problems.append(f"{name}: constituents missing")
+        if (index.get("trend", {}).get("sessions") or 0) < MIN_CHART_SESSIONS:
+            problems.append(f"{name}: one-year chart missing")
 
-### סיכום יומי – סגירת {LAST_US_CLOSE}
-ניתוח מקיף של יום המסחר האחרון: מה קרה, מה הניע, אווירה, נרטיבים שולטים.
-חובה להתייחס גם ל-S&P 500 / SPY וגם לנאסד"ק 100 / QQQ, כולל מחיר/שינוי יומי ומה ההבדל ביניהם אם היה פער בביצועים.
-אם קיימים נתוני מגמות לאורך היום (בנתונים) — תאר כיצד השוק התפתח משעה לשעה.
-חבר בין אירועים גלובליים לתנועות השוק — שרשרת סיבה-ותוצאה. לפחות 6 משפטים.
+    for name, sector in data.get("sectors", {}).items():
+        stocks = sector.get("top_stocks_by_market_cap", [])
+        if len(stocks) != 3:
+            problems.append(f"{name}: expected three leading stocks")
+        if (sector.get("trend", {}).get("sessions") or 0) < MIN_CHART_SESSIONS:
+            problems.append(f"{name}: one-year sector chart missing")
+        for stock in stocks:
+            if (stock.get("technical_analysis", {}).get("sessions") or 0) < MIN_STOCK_CHART_SESSIONS:
+                problems.append(f"{name}/{stock.get('symbol') or stock.get('name')}: chart missing")
 
-### מטבעות וסחורות (Currencies and Commodities)
-חובה לכלול בשורות נפרדות: דולר/שקל, אירו/שקל, ביטקוין ואת'ריום.
-לכל אחד כתוב שער/מחיר אחרון, שינוי יומי באחוזים לעומת הסגירה הקודמת, וחץ ▲/▼.
-אפשר להוסיף זהב ונפט רק אם הנתונים קיימים, בשורה נפרדת ובקצרה.
+    if len(data.get("sectors", {})) != 10:
+        problems.append("sector coverage incomplete")
+    if problems:
+        raise RuntimeError("Critical TASE data validation failed: " + "; ".join(problems))
 
-### גיאופוליטיקה, מגמות ונרטיבים שולטים
-זהה קשרים לא-ברורים בין אירועים עולמיים לשווקים:
-• תאר את האירוע/המגמה הגלובלית
-• הסבר שרשרת ההשפעה: אירוע → נפט/ריבית/מטבע → סקטור → שוק
-• ציין אם קצרת/ארוכת טווח
-לפחות 4 קשרים. זהו מגמות גדולות שמעצבות את השוק כרגע.
 
-### השווקים האמריקאים והכלכלה – סגירת {LAST_US_CLOSE}
-כל הנתונים מתייחסים לסגירת {LAST_US_CLOSE}. אל תשתמש בלשון הווה כאילו השוק פתוח.
-SPY/QQQ/דאו/ראסל עם מחירים ואחוזים. VIX. חוזים, זהב, נפט. מאקרו עם מספרים. מדיניות הפד. תשואות אג"ח 2/10/30. 6-8 משפטים.
+def _groq_completion(
+    client: Groq,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    purpose: str,
+) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.25,
+        max_tokens=max_tokens,
+        reasoning_effort="low",
+    )
+    usage = getattr(response, "usage", None)
+    if usage:
+        print(
+            f"AI usage [{purpose}]: prompt={getattr(usage, 'prompt_tokens', '?')}, "
+            f"completion={getattr(usage, 'completion_tokens', '?')}, "
+            f"total={getattr(usage, 'total_tokens', '?')}"
+        )
+    return response.choices[0].message.content.strip()
 
-### שווקים גלובליים
-ביצועי אסיה ואירופה בסגירה האחרונה, עם מספרים. הסבר קצר לתנועה חריגה.
 
-### מדד פחד ותאוות בצע
-ציון המדד: 0-25=פחד קיצוני, 26-45=פחד, 46-55=ניטרלי, 56-75=חמדנות, 76-100=חמדנות קיצונית.
-פרש לעומק:
-• מה הציון הנוכחי ומה הוא מסמן
-• הסבר מה "פחד" אומר בפועל: משקיעים מוכרים מתוך חרדה, מחירים יורדים — היסטורית זו לרוב הזדמנות קנייה. מה "חמדנות" אומר: השוק חם, כולם קונים, סיכון לתיקון חד.
-• מה קרה היסטורית כשהמדד היה ברמה דומה
-• מה המנוי צריך לדעת ולהיערך אליו בהתאם לרמה הנוכחית — האם להיות זהיר, להמתין, או לנצל הזדמנות
+def _require_ai_sections(text: str, required_titles: tuple[str, ...]) -> None:
+    missing = [title for title in required_titles if f"### {title}" not in text]
+    if missing:
+        raise RuntimeError("AI response missing required sections: " + ", ".join(missing))
 
-### סבב סקטורים
-לכל סקטור: שם, סימבול ETF, אחוז שינוי בסגירה האחרונה, חץ ▲/▼. נתח מה הרוטציה מעידה.
-כל סקטור חייב להופיע בשורה נפרדת. אל תכתוב כמה סקטורים באותה פסקה.
 
-### ניתוח חדשות מרכזיות
-5-6 חדשות מהימים האחרונים. לכל חדשה:
-• כותרת הנושא
-• מה קרה בפועל עם מספרים ספציפיים
-• לאיזה כיוון זה משפיע על השוק (עלייה/ירידה) ועל אילו סקטורים ספציפיים (טכנולוגיה/אנרגיה/בנקים/נדל"ן וכו')
-• מה המנוי צריך לדעת — סיכון, הזדמנות, או משהו לעקוב אחריו
-• מקור החדשה וקישור אם קיים מתוך הנתונים
-אסור לכתוב "משפיע על השווקים" בלי לפרט באיזה כיוון ועל אילו סקטורים.
+def generate_hebrew_brief(data: dict) -> str:
+    """Generate fact-grounded Israeli index and sector analysis in bounded calls."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is required to generate the briefing")
 
-### מסקנות ומה לעקוב אחריו ב-{TODAY_SHORT}
-3-4 נקודות ממוספרות — כולל לפחות נקודה אחת על מגמה/סיכון גלובלי.
+    client = Groq(
+        api_key=GROQ_API_KEY,
+        timeout=GROQ_TIMEOUT_SECONDS,
+        max_retries=1,
+    )
+    model = GROQ_MODEL
+    market_data = json.dumps(
+        _compact_market_payload(data),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    date_label = _today().strftime("%d.%m.%Y")
+
+    market_prompt = f"""אתה אנליסט הבורסה בתל אביב. כתוב בעברית תקנית וקצרה ל-{date_label}, על סמך הנתונים בלבד.
+
+כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, SMA-20/50/200, RSI-14, MACD, תמיכה/התנגדות, מחזור וקווי מגמה. bias הוא אינדיקציה בלבד.
+
+כתוב עד 300 מילים ובדיוק את הסעיפים הבאים:
+### תמונת מצב בבורסה בתל אביב
+סיכום הסגירה והמסר המרכזי.
+
+### מבט להמשך
+שתי פסקאות: "הימים הקרובים" (1–5 ימי מסחר) ו"השבועות הקרובים" (2–6 שבועות). בכל אחת: תרחיש בסיס, חיובי ושלילי, טריגר ואות ביטול, במילים פשוטות.
+
+מקרא: ret_1m_3m_6m_1y_pct=תשואות; above_sma_20_50_200=מיקום מעל הממוצעים; macd_hist=היסטוגרמת MACD; support_resistance_60d=תמיכה/התנגדות; turnover_x_avg20=מחזור יחסי; trendline_60d_200d_pct=קווי מגמה.
 
 נתונים:
-{data_us}"""
+{market_data}"""
 
-    resp1 = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt_us}],
-        temperature=0.3,
-        max_tokens=5000,
+    sector_overview = json.dumps(
+        _compact_sector_overview(data),
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    brief_us = resp1.choices[0].message.content
+    sector_prompt = f"""אתה אנליסט סקטורים של הבורסה בתל אביב. כתוב בעברית תקנית, קצרה וברורה.
 
-    # ── Call 2: Israeli Market only ───────────────────────────────────────────
-    data_israel = (
-        f"מניות ת\"א: {json.dumps(tase_stocks, ensure_ascii=False)}\n"
-        f"מדד ת\"א-125: {json.dumps(global_mkts.get('TA-125 (תל אביב)', {}), ensure_ascii=False)}\n"
-        f"דולר/שקל: {json.dumps(market.get('USD/ILS', {}), ensure_ascii=False)}\n"
-        f"S&P500 (לקורלציה): {json.dumps(market.get('SPY (S&P 500)', {}), ensure_ascii=False)}\n"
-        f"כותרות ישראליות: {json.dumps(news_israel, ensure_ascii=False)}"
-    )
+דרג את כל עשרת הסקטורים לפי שילוב של ביצועי חודש/3/6/12 חודשים, רוחב, תנודתיות, ממוצעים נעים, RSI, MACD וקווי מגמה. אל תסתמך על יום אחד ואל תמציא נתונים.
 
-    prompt_israel = f"""אתה אנליסט פיננסי בכיר המתמחה בשוק הישראלי. כתוב **בעברית בלבד** כמו בכלכליסט/גלובס.
-כל סעיף מתחיל ב-### ואחריו שם הסעיף.
+כתוב עד 220 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
+### סקטורים בולטים ותובנות AI
+- **מועדף – שם הסקטור:** משפט אחד עם תזה, סיכון, תנאי אישור וביטול.
+- **מעקב – שם הסקטור:** משפט אחד באותו מבנה.
+- **להמתין – שם הסקטור:** משפט אחד באותו מבנה.
+- **חלשים:** משפט אחד שמציין את הסקטורים החלשים והסיבה.
 
-== חוקי תוכן — חובה לפעול לפיהם ==
-• כתוב **רק** על אירועים שמופיעים במפורש בנתונים שסופקו להלן.
-• **אסור** להזכיר אירועים היסטוריים מהידע הכללי שלך — אין COVID-19, אין ברקזיט, אין אירועים ישנים שאינם בנתונים.
-• אם כותרת חדשה מסומנת "תאריך לא ידוע" — השתמש בה בזהירות בלבד.
-• אם אין מספיק מידע על נושא — דלג עליו. עדיף פחות תוכן ממידע לא מדויק.
+### מבט סקטוריאלי להמשך
+- **תרחיש בסיס:** משפט אחד, מובילים ורמת ביטחון.
+- **תרחיש חיובי:** משפט אחד, טריגר ומובילים.
+- **תרחיש שלילי:** משפט אחד, טריגר והסקטורים הפגיעים.
 
-== חוקי זמן ==
-הבריפינג נשלח ב-{TODAY_SHORT} בשעה 07:00. המסחר טרם נפתח.
-• נתוני ת"א הם מסגירת {LAST_IL_DAY_HE}, {LAST_IL_CLOSE} — כתוב "בסגירת {LAST_IL_CLOSE}" ולא "היום"
-• {il_status}
-• אסור לכתוב "השוק עלה היום" — כתוב "בסגירת {LAST_IL_CLOSE} עלה" או "בסגירה האחרונה"
-
-### שוק ההון הישראלי – סגירת {LAST_IL_CLOSE}
-• ביצועי מדד ת"א-125 בסגירת {LAST_IL_CLOSE} — מספרים ואחוזי שינוי
-• מניות מגמה בולטות: סימבול, מחיר, אחוז שינוי, חץ ▲/▼
-• מומנטום כללי — עלייה/ירידה ומה הניע
-• שער דולר/שקל בסגירה האחרונה — פרשנות וקשר לאירועים גלובליים
-• קורלציה עם וול סטריט בסגירת {LAST_US_CLOSE}
-• חדשות כלכליות ישראליות רלוונטיות, רק אם קיימות בכותרות הישראליות שסופקו
-אם אין חדשות ישראליות מעניינות או רלוונטיות בנתונים — אל תכתוב על חדשות בכלל, ואל תחליף אותן בחדשות מחו"ל.
-לפחות 7 משפטים.
+מקרא: ret_1m_3m_6m_1y_pct = תשואות חודש/3/6/12 חודשים; above_sma_20_50_200 = מעל ממוצעים 20/50/200; macd_hist = היסטוגרמת MACD; trendline_60d_200d_pct = קווי מגמה.
 
 נתונים:
-{data_israel}"""
+{sector_overview}"""
 
-    resp2 = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt_israel}],
-        temperature=0.3,
-        max_tokens=2000,
+    market_brief = _groq_completion(
+        client, model, market_prompt, max_tokens=900, purpose="market"
     )
-    brief_israel = resp2.choices[0].message.content
+    _require_ai_sections(market_brief, ("תמונת מצב בבורסה בתל אביב", "מבט להמשך"))
+    sector_brief = _groq_completion(
+        client, model, sector_prompt, max_tokens=700, purpose="sectors"
+    )
+    _require_ai_sections(
+        sector_brief,
+        ("סקטורים בולטים ותובנות AI", "מבט סקטוריאלי להמשך"),
+    )
+    quantitative_cards = build_quantitative_cards(data)
+    source_cards = build_source_context_cards(data)
+    return "\n\n".join([market_brief, quantitative_cards, sector_brief, source_cards])
 
-    # ── Stitch together: Israel section goes after the daily summary ──────────
-    # Split Call 1 output into individual ### sections
-    sections = re.split(r'\n(?=###)', brief_us.strip())
-    if len(sections) >= 2:
-        # sections[0] = daily summary, sections[1:] = everything else
-        return sections[0] + "\n\n" + brief_israel.strip() + "\n\n" + "\n\n".join(sections[1:])
-    # Fallback: append Israel at the end
-    return brief_us + "\n\n" + brief_israel
+
+def _render_inline_markdown(text: str) -> str:
+    escaped = html.escape(text, quote=False)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        r'<a href="\2" style="color:#1e5d9b;">\1</a>',
+        escaped,
+    )
+    return escaped
 
 
-# ── 12. HTML Email Builder ─────────────────────────────────────────────────────
-def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
-    """Wrap the Hebrew brief in a dark-themed, bubble-card RTL HTML email."""
-    day_names = {
-        "Monday": "יום שני", "Tuesday": "יום שלישי", "Wednesday": "יום רביעי",
-        "Thursday": "יום חמישי", "Friday": "יום שישי", "Saturday": "שבת", "Sunday": "יום ראשון"
-    }
-    day_he   = day_names.get(datetime.now().strftime("%A"), "")
-    date_str = f"{day_he}, {TODAY}"
+def _is_table_separator(line: str) -> bool:
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
 
-    # Split the AI output into bubble cards by ### headings
-    sections = re.split(r'###\s*', brief_text.strip())
-    cards_html = ""
-    for sec in sections:
-        if not sec.strip():
+
+def _table_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _render_markdown_block(text: str) -> str:
+    """Render the small Markdown subset used by the brief into RTL-safe HTML."""
+    lines = text.splitlines()
+    rendered = []
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line or line == "---":
+            index += 1
             continue
-        lines      = sec.strip().split('\n', 1)
-        title      = lines[0].strip()
-        body       = lines[1].strip() if len(lines) > 1 else ""
-        body_html  = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', body)
-        body_html  = body_html.replace('\n', '<br>')
-        # Start a new line after each sentence-ending period
-        body_html  = re.sub(r'\.\s+(?=[א-תA-Z])', '.<br>', body_html)
-        cards_html += f"""
-    <div class="card">
-      <div class="card-title">{title}</div>
-      <div class="card-body">{body_html}</div>
-    </div>"""
+
+        if (
+            "|" in line
+            and index + 1 < len(lines)
+            and _is_table_separator(lines[index + 1])
+        ):
+            headers = _table_cells(line)
+            index += 2
+            rows = []
+            while index < len(lines) and "|" in lines[index] and lines[index].strip():
+                rows.append(_table_cells(lines[index]))
+                index += 1
+            header_html = "".join(
+                f'<th scope="col">{_render_inline_markdown(cell)}</th>'
+                for cell in headers
+            )
+            row_html = "".join(
+                "<tr>" + "".join(
+                    f"<td>{_render_inline_markdown(cell)}</td>" for cell in row
+                ) + "</tr>"
+                for row in rows
+            )
+            rendered.append(
+                f'<div class="table-wrap" dir="rtl"><table dir="rtl"><thead><tr>{header_html}'
+                f'</tr></thead><tbody>{row_html}</tbody></table></div>'
+            )
+            continue
+
+        if re.match(r"^[-*]\s+", line):
+            items = []
+            while index < len(lines):
+                match = re.match(r"^[-*]\s+(.+)", lines[index].strip())
+                if not match:
+                    break
+                items.append(f'<li dir="rtl">{_render_inline_markdown(match.group(1))}</li>')
+                index += 1
+            rendered.append(f'<ul dir="rtl">{"".join(items)}</ul>')
+            continue
+
+        if re.match(r"^\d+[.)]\s+", line):
+            items = []
+            while index < len(lines):
+                match = re.match(r"^\d+[.)]\s+(.+)", lines[index].strip())
+                if not match:
+                    break
+                items.append(f'<li dir="rtl">{_render_inline_markdown(match.group(1))}</li>')
+                index += 1
+            rendered.append(f'<ol dir="rtl">{"".join(items)}</ol>')
+            continue
+
+        if line.startswith("####"):
+            rendered.append(
+                f'<div class="subheading" dir="rtl">{_render_inline_markdown(line[4:].strip())}</div>'
+            )
+            index += 1
+            continue
+
+        paragraph = [line]
+        index += 1
+        while index < len(lines):
+            candidate = lines[index].strip()
+            if (
+                not candidate
+                or candidate == "---"
+                or candidate.startswith("####")
+                or re.match(r"^[-*]\s+", candidate)
+                or re.match(r"^\d+[.)]\s+", candidate)
+                or ("|" in candidate and index + 1 < len(lines) and _is_table_separator(lines[index + 1]))
+            ):
+                break
+            paragraph.append(candidate)
+            index += 1
+        rendered.append(
+            f'<p dir="rtl">{_render_inline_markdown(" ".join(paragraph))}</p>'
+        )
+    return "".join(rendered)
+
+
+def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
+    now = _today()
+    date_str = now.strftime("%d/%m/%Y")
+    normalized = re.sub(r"(?m)^\s*#{1,2}\s+###\s+", "### ", brief_text.strip())
+    headings = list(re.finditer(r"(?m)^\s*###\s+(.+?)\s*$", normalized))
+    cards = []
+    for position, heading in enumerate(headings):
+        title_text = heading.group(1).strip()
+        if "פרופיל" in title_text:
+            continue
+        body_start = heading.end()
+        body_end = headings[position + 1].start() if position + 1 < len(headings) else len(normalized)
+        title = html.escape(title_text)
+        body = _render_markdown_block(normalized[body_start:body_end].strip())
+        card_class = "card index-card" if title_text.startswith("מדד ת״א-") else "card"
+        cards.append(
+            f'<div class="{card_class}" dir="rtl" align="right"><div class="card-title" dir="rtl">{title}</div>'
+            f'<div class="card-body" dir="rtl" align="right">{body}</div></div>'
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>תדריך פיננסי יומי – {TODAY}</title>
+  <title>תדריך שוק ההון הישראלי – {date_str}</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
-      font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
-      background: #e8edf4;
-      direction: rtl;
-      text-align: right;
-      color: #1e2d42;
-    }}
-    .wrapper {{
-      max-width: 680px;
-      margin: 0 auto;
-      padding: 24px 16px 40px;
-    }}
-    /* ── Header — dark navy anchor, gold title ── */
-    .header {{
-      background: linear-gradient(135deg, #1a3a6e 0%, #1e4d8c 60%, #1a3a6e 100%);
-      border: 1px solid #2a509a;
-      border-radius: 16px;
-      padding: 34px 36px 28px;
-      text-align: center;
-      margin-bottom: 6px;
-    }}
-    .header .logo {{
-      font-size: 10px;
-      color: #7aaad8;
-      letter-spacing: 4px;
-      text-transform: uppercase;
-      margin-bottom: 12px;
-    }}
-    .header h1 {{
-      color: #f0c040;
-      font-size: 30px;
-      font-weight: 800;
-      margin-bottom: 8px;
-      letter-spacing: 0.5px;
-    }}
-    .header .date {{
-      color: #a8c8e8;
-      font-size: 14px;
-    }}
-    /* ── Gold accent line ── */
-    .accent {{
-      height: 3px;
-      background: linear-gradient(90deg, transparent, #f0c040, #e08030, #f0c040, transparent);
-      margin: 18px 40px;
-      border-radius: 2px;
-    }}
-    /* ── Bubble Cards ── */
-    .card {{
-      background: #f0f5fc;
-      border: 1px solid #c8d8ea;
-      border-radius: 14px;
-      padding: 22px 26px 20px;
-      margin-bottom: 14px;
-      box-shadow: 0 2px 10px rgba(30,60,100,0.08);
-    }}
-    .card-title {{
-      font-size: 16px;
-      font-weight: 700;
-      color: #1a3a6e;
-      border-bottom: 2px solid #dce8f4;
-      padding-bottom: 10px;
-      margin-bottom: 14px;
-      letter-spacing: 0.3px;
-      direction: rtl;
-      text-align: right;
-    }}
-    .card-body {{
-      font-size: 15px;
-      line-height: 2.0;
-      color: #2c3e52;
-      direction: rtl;
-      text-align: right;
-      unicode-bidi: embed;
-    }}
-    .card-body * {{
-      direction: rtl;
-      text-align: right;
-    }}
-    strong {{
-      color: #0f2d5e;
-      font-weight: 700;
-    }}
-    /* ── Footer ── */
-    .footer {{
-      text-align: center;
-      padding: 18px 20px 4px;
-      font-size: 11px;
-      color: #7a90a8;
-      direction: rtl;
-      line-height: 1.8;
-    }}
+    body {{ font-family:Arial,"Noto Sans Hebrew",sans-serif; background:#e8edf4; color:#1e2d42; direction:rtl; text-align:right; }}
+    .wrapper {{ max-width:720px; margin:0 auto; padding:24px 16px 40px; }}
+    .header {{ background:linear-gradient(135deg,#123767,#1f5797); border-radius:16px; padding:34px; text-align:center; }}
+    .logo {{ color:#9ec3e8; font-size:10px; letter-spacing:3px; margin-bottom:10px; }}
+    h1 {{ color:#f0c040; font-size:28px; margin-bottom:8px; }}
+    .date {{ color:#c1d8ef; font-size:14px; }}
+    .accent {{ height:3px; margin:18px 40px; background:linear-gradient(90deg,transparent,#f0c040,#e08030,#f0c040,transparent); }}
+    .card {{ background:#f7faff; border:1px solid #c8d8ea; border-radius:14px; padding:22px 26px; margin-bottom:14px; box-shadow:0 2px 10px rgba(30,60,100,.08); }}
+    .index-card {{ border-right:5px solid #1f5797; }}
+    .card-title {{ color:#163e70; font-size:17px; font-weight:700; border-bottom:2px solid #dce8f4; padding-bottom:10px; margin-bottom:14px; }}
+    .card-body {{ color:#2c3e52; font-size:14.5px; line-height:1.9; direction:rtl; text-align:right; unicode-bidi:plaintext; }}
+    .card-body p {{ margin:0 0 12px; direction:rtl; text-align:right; }}
+    .card-body ul,.card-body ol {{ margin:0 0 14px; padding:0 22px 0 0; direction:rtl; text-align:right; }}
+    .card-body li {{ margin-bottom:7px; padding-right:2px; direction:rtl; text-align:right; }}
+    .subheading {{ color:#214f82; font-weight:700; margin:13px 0 7px; direction:rtl; text-align:right; }}
+    .table-wrap {{ width:100%; overflow-x:auto; margin:10px 0 14px; direction:rtl; }}
+    table {{ width:100%; border-collapse:collapse; direction:rtl; text-align:right; }}
+    th {{ background:#e5eef8; color:#163e70; font-weight:700; }}
+    th,td {{ border:1px solid #c8d8ea; padding:8px 9px; vertical-align:top; direction:rtl; text-align:right; }}
+    strong {{ color:#0f2d5e; }}
+    .notice {{ background:#fff8df; border:1px solid #ead58b; color:#66551c; border-radius:10px; padding:13px 16px; margin-top:16px; font-size:12px; line-height:1.7; }}
+    .footer {{ text-align:center; color:#71869d; font-size:11px; padding:18px; line-height:1.8; }}
   </style>
 </head>
-<body>
-  <div class="wrapper">
-    <div class="header">
-      <div class="logo">Financial Intelligence Agent</div>
-      <h1>תדריך פיננסי יומי</h1>
-      <div class="date">{date_str}</div>
-    </div>
-    <div class="accent"></div>
-    {cards_html}
-    <div class="footer">
-      נוצר אוטומטית ב-{TODAY} &nbsp;|&nbsp; Yahoo Finance · FRED · Finnhub · Alpha Vantage · RSS<br>
-      <a href="{unsubscribe_url}" style="color:#4a7aaa; font-size:11px;">ביטול הרשמה</a>
-      &nbsp;|&nbsp;
-      <span style="color:#8a9fb8;">המידע מיועד לצרכי מידע בלבד ואינו מהווה ייעוץ השקעות</span>
-    </div>
+<body dir="rtl" align="right"><div class="wrapper" dir="rtl" align="right">
+  <div class="header"><div class="logo">ISRAEL MARKET INTELLIGENCE</div><h1>תדריך שוק ההון הישראלי</h1><div class="date">{date_str}</div></div>
+  <div class="accent"></div>
+  {''.join(cards)}
+  <div class="notice">התחזיות בתדריך הן תרחישים המבוססים על נתוני עבר ומידע ציבורי. הן אינן הבטחת תשואה, המלצה אישית או תחליף לייעוץ השקעות מורשה.</div>
+  <div class="footer" dir="rtl">מקורות: הבורסה לניירות ערך ומאיה · בנק ישראל · הלמ״ס · משרד האוצר · גלובס · כלכליסט · TheMarker · Bizportal · Funder<br>
+    <a href="{html.escape(unsubscribe_url, quote=True)}" style="color:#4a7aaa;">ביטול הרשמה</a>
   </div>
-</body>
-</html>"""
+</div></body></html>"""
 
 
-# ── 13. Send Email ─────────────────────────────────────────────────────────────
-def send_email(html_content: str, subject: str, recipient_email: str):
-    """Send the HTML email to a single recipient via Gmail SMTP."""
-    msg            = MIMEMultipart("alternative")
+def send_email(html_content: str, subject: str, recipient_email: str) -> None:
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = recipient_email
+    msg["From"] = GMAIL_USER
+    msg["To"] = recipient_email
     msg.attach(MIMEText(html_content, "html", "utf-8"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, recipient_email, msg.as_string())
-    print(f"  ✅ Sent to {recipient_email}")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
-def main():
-    print(f"🚀 Starting Financial Brief Agent – {TODAY}")
-
-    # Ensure DB exists and owner is always subscribed
+def run(send: bool = True, include_news: bool = True) -> dict:
     database.init_db()
     if OWNER_EMAIL:
         database.seed_owner(OWNER_NAME, OWNER_EMAIL)
     backup_status = database.snapshot_subscribers_once_daily()
-    print(f"💾 Subscriber backup: {backup_status}")
 
-    print("📈 Collecting US market data...")
-    market      = get_market_snapshot()
-    global_mkts = get_global_markets()
-    tase_stocks = get_tase_stocks()
-    yields      = get_treasury_yields()
-    movers      = get_top_movers()
-    sectors     = get_sector_performance()
-    fear_greed  = get_fear_greed()
+    data = collect_israeli_market_data(include_news=include_news)
+    validate_market_data(data)
+    brief_text = generate_hebrew_brief(data)
+    result = {
+        "as_of": data.get("as_of"),
+        "collection_stats": data.get("collection_stats", {}),
+        "backup": backup_status,
+        "subscriber_count": 0,
+        "sent": 0,
+        "failed": [],
+        "brief": brief_text,
+    }
+    if not send:
+        return result
 
-    print("📰 Fetching news from RSS feeds...")
-    news = get_news_rss()
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        raise RuntimeError("GMAIL_USER and GMAIL_APP_PASSWORD are required to send email")
 
-    print("📅 Fetching earnings calendar...")
-    earnings = get_earnings_today()
-
-    print("📊 Fetching macro indicators (FRED)...")
-    fred = get_fred_indicators()
-
-    print("🤖 Generating Hebrew brief with Groq AI...")
-    brief_text = generate_hebrew_brief(
-        market, global_mkts, yields, movers,
-        sectors, fear_greed, news, earnings, fred, tase_stocks
-    )
-
-    print("📧 Sending to all subscribers...")
-    subject     = f"תדריך פיננסי יומי – {TODAY}"
     subscribers = database.get_active_subscribers()
-    print(f"   Found {len(subscribers)} subscriber(s)")
+    result["subscriber_count"] = len(subscribers)
+    subject = f"תדריך שוק ההון הישראלי – {_today().strftime('%d/%m/%Y')}"
+    for subscriber in subscribers:
+        try:
+            unsubscribe_url = f"{BASE_URL}/unsubscribe/{subscriber['token']}"
+            content = build_html_email(brief_text, unsubscribe_url)
+            send_email(content, subject, subscriber["email"])
+            result["sent"] += 1
+        except Exception as exc:
+            result["failed"].append({"email": subscriber["email"], "error": str(exc)})
+    return result
 
-    for sub in subscribers:
-        unsubscribe_url = f"{BASE_URL}/unsubscribe/{sub['token']}"
-        html = build_html_email(brief_text, unsubscribe_url)
-        send_email(html, subject, sub["email"])
 
-    print(f"✅ All done! Sent to {len(subscribers)} subscriber(s)")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Israeli stock-market morning briefing")
+    parser.add_argument("--dry-run", action="store_true", help="Generate but do not send email")
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Validate sources without AI generation, database writes, or email",
+    )
+    parser.add_argument("--no-news", action="store_true", help="Skip press feeds during diagnostics")
+    args = parser.parse_args()
+    if args.collect_only:
+        data = collect_israeli_market_data(include_news=not args.no_news)
+        validate_market_data(data)
+        summary = {
+            "as_of": data.get("as_of"),
+            "indices": {
+                name: {
+                    "constituents": index.get("constituents_count"),
+                    "chart_sessions": index.get("trend", {}).get("sessions"),
+                }
+                for name, index in data.get("indices", {}).items()
+            },
+            "sectors": {
+                name: {
+                    "top_stocks": len(sector.get("top_stocks_by_market_cap", [])),
+                    "chart_sessions": sector.get("trend", {}).get("sessions"),
+                    "stock_charts": sum(
+                        stock.get("technical_analysis", {}).get("available") is True
+                        for stock in sector.get("top_stocks_by_market_cap", [])
+                    ),
+                }
+                for name, sector in data.get("sectors", {}).items()
+            },
+            "maya_announcements": len(data.get("maya_announcements", [])),
+            "news_headlines": len(data.get("news", [])),
+            "boi_rates": sorted(data.get("exchange_rates", {}).get("rates", {})),
+            "collection_stats": data.get("collection_stats", {}),
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+    result = run(send=not args.dry_run, include_news=not args.no_news)
+    printable = {key: value for key, value in result.items() if key != "brief"}
+    print(json.dumps(printable, ensure_ascii=False, indent=2))
+    if args.dry_run:
+        print("\n" + result["brief"])
 
 
 if __name__ == "__main__":

@@ -18,11 +18,21 @@ DB_PATH = os.getenv(
 )
 
 
+class ClosingConnection(sqlite3.Connection):
+    """SQLite context manager that also closes the connection on exit."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def get_connection():
     db_dir = os.path.dirname(os.path.abspath(DB_PATH))
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 

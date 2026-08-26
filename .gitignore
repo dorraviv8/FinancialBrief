@@ -20,3 +20,6 @@ subscribers.db
 # ── Logs ──
 *.log
 logs/
+
+# ── Regenerable market history cache ──
+market-cache/

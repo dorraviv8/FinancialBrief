@@ -1,0 +1,21 @@
+[Unit]
+Description=Israeli stock-market morning briefing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=YOUR_GCP_USER
+WorkingDirectory=/opt/financialbrief
+EnvironmentFile=/etc/financialbrief.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/financialbrief/fin_env/bin/python /opt/financialbrief/financial_brief.py
+
+# Basic service hardening while retaining network and database access.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/financialbrief
+
+[Install]
+WantedBy=multi-user.target

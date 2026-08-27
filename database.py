@@ -388,6 +388,27 @@ def record_sector_score_predictions(data: dict, sector_scores: dict) -> dict:
     return {"predictions_upserted": len(rows)}
 
 
+def get_latest_sector_scores() -> dict:
+    """Return the most recent stored score for each sector."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.trade_date, p.sector_name, p.graph_score,
+                   p.news_adjustment, p.calibration_adjustment, p.final_score
+            FROM sector_score_predictions p
+            JOIN (
+                SELECT sector_name, MAX(trade_date) AS latest_trade_date
+                FROM sector_score_predictions
+                GROUP BY sector_name
+            ) latest
+              ON latest.sector_name = p.sector_name
+             AND latest.latest_trade_date = p.trade_date
+            ORDER BY p.sector_name
+            """
+        ).fetchall()
+    return {row["sector_name"]: dict(row) for row in rows}
+
+
 def settle_sector_score_outcomes() -> dict:
     """Settle due 2/4/6-week predictions against TA-125 total price return."""
     settled = 0

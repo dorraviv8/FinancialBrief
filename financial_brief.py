@@ -608,6 +608,325 @@ def build_source_context_cards(data: dict) -> str:
     ))
 
 
+def _score_delta(name: str, score: dict, previous_scores: dict) -> int | None:
+    previous = previous_scores.get(name)
+    if not previous:
+        return None
+    try:
+        return int(score["final_score"]) - int(previous["final_score"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _score_delta_text(delta: int | None) -> str:
+    if delta is None:
+        return "חדש"
+    if delta == 0:
+        return "ללא שינוי"
+    return f"{delta:+d}"
+
+
+def _score_change_reason(name: str, score: dict, previous_scores: dict) -> str:
+    previous = previous_scores.get(name, {})
+    if not previous:
+        return "נקודת בסיס ראשונה להשוואות בדוחות הבאים"
+    graph_delta = score.get("graph_score", 0) - previous.get("graph_score", 0)
+    news_delta = score.get("news_adjustment", 0) - previous.get("news_adjustment", 0)
+    calibration_delta = (
+        score.get("calibration_adjustment", 0)
+        - previous.get("calibration_adjustment", 0)
+    )
+    reasons = []
+    if graph_delta:
+        reasons.append(f"שינוי בנתוני הגרף {graph_delta:+d}")
+    if news_delta:
+        reasons.append(f"שינוי בהשפעת החדשות {news_delta:+d}")
+    if calibration_delta:
+        reasons.append(f"שינוי בכיול ההיסטורי {calibration_delta:+d}")
+    return "; ".join(reasons) if reasons else "הרכב הציון לא השתנה"
+
+
+def build_reader_dashboard(
+    sector_scores: dict,
+    previous_scores: dict | None = None,
+) -> str:
+    """Put changes and decisions before the detailed daily evidence."""
+    previous_scores = previous_scores or {}
+    ranked = sorted(
+        sector_scores.items(),
+        key=lambda item: item[1]["final_score"],
+        reverse=True,
+    )
+    lines = []
+    if not previous_scores:
+        lines.append(
+            "- **שינוי מהדוח הקודם:** זהו דוח הבסיס הראשון; "
+            "מהדוח הבא יוצג כאן מה השתנה ולמה."
+        )
+    else:
+        changes = [
+            (name, score, _score_delta(name, score, previous_scores))
+            for name, score in ranked
+        ]
+        material = sorted(
+            (item for item in changes if item[2]),
+            key=lambda item: abs(item[2]),
+            reverse=True,
+        )[:4]
+        if material:
+            for name, score, delta in material:
+                lines.append(
+                    f"- **{name}: {score['final_score']}/100 ({delta:+d}).** "
+                    f"{_score_change_reason(name, score, previous_scores)}."
+                )
+        else:
+            lines.append(
+                "- **שינוי מהדוח הקודם:** לא חל שינוי בציוני הסקטורים."
+            )
+
+    leaders = ", ".join(
+        f"{name} ({score['final_score']})" for name, score in ranked[:3]
+    )
+    laggards = ", ".join(
+        f"{name} ({score['final_score']})" for name, score in ranked[-2:]
+    )
+    lines.extend((
+        f"- **המובילים כעת:** {leaders}.",
+        f"- **להמתין ולעקוב:** {laggards}.",
+    ))
+    return "### מה השתנה ומה חשוב הבוקר\n" + "\n".join(lines)
+
+
+def _compact_trend_sentence(sector: dict) -> str:
+    trend = sector.get("trend", {})
+    if not trend.get("available"):
+        return "נתוני הגרף אינם זמינים כעת"
+    average_states = [
+        trend.get(f"above_sma_{period}") for period in (20, 50, 200)
+    ]
+    above_count = sum(state is True for state in average_states)
+    rsi = trend.get("rsi_14")
+    if rsi is None:
+        demand = "עוצמת הביקוש אינה זמינה"
+    elif rsi >= 65:
+        demand = "הביקוש חזק"
+    elif rsi <= 35:
+        demand = "לחץ המכירות חזק"
+    else:
+        demand = "הביקוש וההיצע מאוזנים יחסית"
+    movement = (
+        "התנועה הקצרה מתחזקת"
+        if (trend.get("macd_histogram") or 0) > 0
+        else "התנועה הקצרה נחלשת"
+        if (trend.get("macd_histogram") or 0) < 0
+        else "התנועה הקצרה יציבה"
+    )
+    return (
+        f"חודש {_format_pct(trend.get('return_20d_pct'))}, "
+        f"שלושה חודשים {_format_pct(trend.get('return_3m_pct'))}; "
+        f"המחיר מעל {above_count} מתוך 3 ממוצעי המחיר; {demand}; {movement}"
+    )
+
+
+def _compact_calibration_sentence(calibration: dict | None) -> str:
+    calibration = calibration or {}
+    ready = []
+    labels = {10: "שבועיים", 20: "4 שבועות", 30: "6 שבועות"}
+    for horizon in (10, 20, 30):
+        stats = calibration.get("horizons", {}).get(horizon, {})
+        if (stats.get("sample_size") or 0) >= database.CALIBRATION_MIN_DISPLAY_CASES:
+            ready.append(
+                f"{labels[horizon]}: {_format_number(stats.get('hit_rate_pct'), 1)}% "
+                f"הצלחה ו-{_format_pct(stats.get('avg_excess_return_pct'))} "
+                f"תשואה עודפת בממוצע"
+            )
+    if not ready:
+        return "הכיול ההיסטורי עדיין אוסף מקרים; טרם מוצגת מסקנה"
+    return "; ".join(ready)
+
+
+def _selected_sector_names(
+    sector_scores: dict,
+    previous_scores: dict,
+    maximum: int = 5,
+) -> list[str]:
+    ranked = sorted(
+        sector_scores,
+        key=lambda name: sector_scores[name]["final_score"],
+        reverse=True,
+    )
+    selected = ranked[:3]
+    extras = sorted(
+        (
+            name for name in ranked[3:]
+            if abs(_score_delta(name, sector_scores[name], previous_scores) or 0) >= 5
+            or sector_scores[name].get("news_adjustment", 0) != 0
+        ),
+        key=lambda name: (
+            abs(_score_delta(name, sector_scores[name], previous_scores) or 0),
+            abs(sector_scores[name].get("news_adjustment", 0)),
+        ),
+        reverse=True,
+    )
+    for name in extras:
+        if name not in selected and len(selected) < maximum:
+            selected.append(name)
+    return selected
+
+
+def build_reader_quantitative_cards(
+    data: dict,
+    sector_scores: dict,
+    calibration: dict | None = None,
+    previous_scores: dict | None = None,
+) -> str:
+    """Render a compact decision-oriented email instead of a data appendix."""
+    calibration = calibration or {}
+    previous_scores = previous_scores or {}
+    close_dates = {
+        _format_market_date(index.get("trend", {}).get("as_of"))
+        for index in data.get("indices", {}).values()
+        if index.get("trend", {}).get("as_of")
+    }
+    close_note = (
+        f"כל הנתונים מתייחסים לסגירת {next(iter(close_dates))}."
+        if len(close_dates) == 1
+        else "תאריך הסגירה מוצג בכל שורה."
+    )
+    index_rows = [
+        "| מדד | סגירה | יומי | חודש | מגמה |",
+        "|---|---:|---:|---:|---|",
+    ]
+    for name in ("ת״א-35", "ת״א-90", "ת״א-125"):
+        index = data.get("indices", {}).get(name, {})
+        trend = index.get("trend", {})
+        index_rows.append(
+            f"| [{name}]({index.get('chart_source')}) | "
+            f"{_format_number(index.get('last_value'))} | "
+            f"{_format_pct(index.get('change_1d_pct'))} | "
+            f"{_format_pct(trend.get('return_20d_pct'))} | "
+            f"{trend.get('directional_bias') or 'לא זמין'} |"
+        )
+    index_card = "### מדדי תל אביב – תמונת סגירה\n" + close_note + "\n" + "\n".join(index_rows)
+
+    ranked = sorted(
+        sector_scores,
+        key=lambda name: sector_scores[name]["final_score"],
+        reverse=True,
+    )
+    ranking_rows = [
+        "| # | סקטור | ציון | שינוי בציון | מגמת חודש |",
+        "|---:|---|---:|---:|---:|",
+    ]
+    for position, name in enumerate(ranked, 1):
+        sector = data.get("sectors", {}).get(name, {})
+        score = sector_scores[name]
+        ranking_rows.append(
+            f"| {position} | {name} | {score['final_score']} – {score['label']} | "
+            f"{_score_delta_text(_score_delta(name, score, previous_scores))} | "
+            f"{_format_pct(sector.get('trend', {}).get('return_20d_pct'))} |"
+        )
+    calibration_ready = any(
+        (stats.get("sample_size") or 0)
+        >= database.CALIBRATION_MIN_ADJUSTMENT_CASES
+        for item in calibration.values()
+        for stats in item.get("horizons", {}).values()
+    )
+    calibration_note = (
+        "הציון כולל כיול היסטורי מוגבל של 5± נקודות."
+        if calibration_ready
+        else "הכיול ההיסטורי עדיין אוסף מקרים ואינו משנה את הציונים כעת."
+    )
+    ranking_card = (
+        "### דירוג כל הסקטורים\n"
+        "הציון מודד אטרקטיביות יחסית ל-2–6 שבועות; הוא אינו הבטחת תשואה. "
+        + calibration_note + "\n" + "\n".join(ranking_rows)
+    )
+
+    detail_lines = []
+    for name in _selected_sector_names(sector_scores, previous_scores):
+        sector = data.get("sectors", {}).get(name, {})
+        score = sector_scores[name]
+        detail_lines.extend((
+            f"#### {name} – {score['final_score']}/100",
+            f"- **למה הסקטור נבחר:** {_compact_trend_sentence(sector)}. {score['reason']}",
+            f"- **מרכיבי הציון:** גרף {score['graph_score']}; חדשות {score['news_adjustment']:+d}; כיול {score.get('calibration_adjustment', 0):+d}. {_compact_calibration_sentence(calibration.get(name))}.",
+        ))
+        stocks = []
+        for stock in sector.get("top_stocks_by_market_cap", []):
+            technical = stock.get("technical_analysis", {})
+            stocks.append(
+                f"[{stock.get('name')} ({stock.get('symbol')})]({stock.get('chart_source')}): "
+                f"יומי {_format_pct(stock.get('change_1d_pct'))}, "
+                f"חודש {_format_pct(technical.get('return_20d_pct'))}"
+            )
+        detail_lines.append(
+            "- **שלוש הגדולות:** " + "; ".join(stocks) + "."
+        )
+        detail_lines.append(
+            f"- [גרף הסקטור הרשמי]({sector.get('chart_source')})"
+        )
+    detail_card = "### העמקה בסקטורים הרלוונטיים\n" + "\n".join(detail_lines)
+    return "\n\n".join((index_card, ranking_card, detail_card))
+
+
+def build_reader_context_card(data: dict, sector_scores: dict) -> str:
+    """Show only news and currency moves that materially affect the reader."""
+    lines = []
+    affected = [
+        (name, score) for name, score in sector_scores.items()
+        if score.get("news_adjustment", 0)
+    ]
+    if affected:
+        for name, score in sorted(
+            affected,
+            key=lambda item: abs(item[1]["news_adjustment"]),
+            reverse=True,
+        ):
+            lines.append(
+                f"- **{name} ({score['news_adjustment']:+d}):** {score['reason']}"
+            )
+    else:
+        lines.append(
+            "- **חדשות:** לא זוהתה היום כותרת ששינתה ציון סקטוריאלי."
+        )
+
+    material_rates = []
+    for currency in ("USD", "EUR", "GBP"):
+        rate = data.get("exchange_rates", {}).get("rates", {}).get(currency, {})
+        try:
+            change = float(rate.get("change_pct"))
+        except (TypeError, ValueError):
+            continue
+        if abs(change) >= 0.5:
+            material_rates.append(f"{currency}/ILS {_format_pct(change)}")
+    if material_rates:
+        lines.append("- **שערי מט״ח מהותיים:** " + ", ".join(material_rates) + ".")
+    else:
+        lines.append("- **שערי מט״ח:** לא נרשמה תנועה יומית של 0.5% או יותר בדולר, באירו או בליש״ט.")
+
+    source_links = []
+    ta125 = data.get("indices", {}).get("ת״א-125", {})
+    if ta125.get("source"):
+        source_links.append(f"[הבורסה לניירות ערך]({ta125['source']})")
+    boi_source = data.get("exchange_rates", {}).get("source")
+    if boi_source:
+        source_links.append(f"[בנק ישראל]({boi_source})")
+    maya = data.get("maya_announcements", [])
+    if maya and maya[0].get("link"):
+        source_links.append(f"[מאיה]({maya[0]['link']})")
+    seen_sources = set()
+    for item in data.get("news", []):
+        source = item.get("source")
+        if source and source not in seen_sources and item.get("link"):
+            source_links.append(f"[{source}]({item['link']})")
+            seen_sources.add(source)
+        if len(seen_sources) >= 4:
+            break
+    lines.append("- **מקורות מרכזיים:** " + ", ".join(source_links) + ".")
+    return "### חדשות, מאקרו ומקורות\n" + "\n".join(lines)
+
+
 def validate_market_data(data: dict) -> None:
     """Refuse to generate or send a briefing from partial critical market data."""
     problems = []
@@ -669,6 +988,7 @@ def _require_ai_sections(text: str, required_titles: tuple[str, ...]) -> None:
 def generate_hebrew_brief(
     data: dict,
     calibration: dict | None = None,
+    previous_scores: dict | None = None,
     score_observer=None,
 ) -> str:
     """Generate fact-grounded Israeli index and sector analysis in bounded calls."""
@@ -692,7 +1012,7 @@ def generate_hebrew_brief(
 
 כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, לממוצעי המחיר, לעוצמת הקונים והמוכרים, לכיוון התנועה, לתמיכה ולהתנגדות. הנתונים הטכניים הם אינדיקציה בלבד.
 
-כתוב לקורא ללא רקע בניתוח טכני, עד 280 מילים ובדיוק את הסעיפים הבאים:
+כתוב לקורא ללא רקע בניתוח טכני, עד 220 מילים ובדיוק את הסעיפים הבאים:
 ### תמונת מצב בבורסה בתל אביב
 סיכום הסגירה והמסר המרכזי. אל תציין תאריך בעצמך; המערכת תוסיף את תאריך הסגירה הרשמי.
 
@@ -725,7 +1045,7 @@ SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10
 
 הציון הסופי הוא graph_score_0_100 ועוד התאמת החדשות ועוד historical_calibration_adjustment, מוגבל ל-0–100. לאחר עשר שורות SCORE, דרג את הסקטורים לפי הציון הסופי.
 
-כתוב לאחר שורות המכונה עד 220 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
+כתוב לאחר שורות המכונה עד 170 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
 ### סקטורים בולטים ותובנות AI
 - **מועדף – שם הסקטור והציון:** משפט אחד עם הסבר פשוט, סיכון ומה ישנה את ההערכה.
 - **מעקב – שם הסקטור והציון:** משפט אחד באותו מבנה.
@@ -734,8 +1054,8 @@ SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10
 
 ### מבט סקטוריאלי להמשך
 - **תרחיש בסיס:** משפט אחד, מובילים ורמת ביטחון.
-- **תרחיש חיובי:** משפט אחד, טריגר ומובילים.
-- **תרחיש שלילי:** משפט אחד, טריגר והסקטורים הפגיעים.
+- **תרחיש חיובי:** משפט אחד, האירוע שישפר את המצב והסקטורים שיובילו.
+- **תרחיש שלילי:** משפט אחד, האירוע שיחליש את המצב והסקטורים הפגיעים.
 
 מקרא: ret_1m_3m_6m_1y_pct = תשואות חודש/3/6/12 חודשים; above_sma_20_50_200 = מעל ממוצעים 20/50/200; macd_hist = היסטוגרמת MACD; trendline_60d_200d_pct = קווי מגמה.
 
@@ -763,9 +1083,21 @@ SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10
     if score_observer is not None:
         score_observer(sector_scores)
     sector_brief = _strip_score_protocol(sector_brief_raw)
-    quantitative_cards = build_quantitative_cards(data, sector_scores, calibration)
-    source_cards = build_source_context_cards(data)
-    return "\n\n".join([market_brief, quantitative_cards, sector_brief, source_cards])
+    dashboard = build_reader_dashboard(sector_scores, previous_scores)
+    quantitative_cards = build_reader_quantitative_cards(
+        data,
+        sector_scores,
+        calibration,
+        previous_scores,
+    )
+    context_card = build_reader_context_card(data, sector_scores)
+    return "\n\n".join([
+        market_brief,
+        dashboard,
+        sector_brief,
+        quantitative_cards,
+        context_card,
+    ])
 
 
 def _render_inline_markdown(text: str) -> str:
@@ -922,7 +1254,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
     .table-wrap {{ width:100%; overflow-x:auto; margin:10px 0 14px; direction:rtl; }}
     table {{ width:100%; border-collapse:collapse; direction:rtl; text-align:right; }}
     th {{ background:#e5eef8; color:#163e70; font-weight:700; }}
-    th,td {{ border:1px solid #c8d8ea; padding:8px 9px; vertical-align:top; direction:rtl; text-align:right; }}
+    th,td {{ border:1px solid #c8d8ea; padding:8px 9px; vertical-align:top; direction:rtl; text-align:right; unicode-bidi:plaintext; }}
     strong {{ color:#0f2d5e; }}
     .notice {{ background:#fff8df; border:1px solid #ead58b; color:#66551c; border-radius:10px; padding:13px 16px; margin-top:16px; font-size:12px; line-height:1.7; }}
     .footer {{ text-align:center; color:#71869d; font-size:11px; padding:18px; line-height:1.8; }}
@@ -972,10 +1304,12 @@ def run(send: bool = True, include_news: bool = True) -> dict:
         for name, sector in data.get("sectors", {}).items()
     }
     calibration = database.get_sector_score_calibration(graph_scores)
+    previous_scores = database.get_latest_sector_scores()
     generated_scores = {}
     brief_text = generate_hebrew_brief(
         data,
         calibration=calibration,
+        previous_scores=previous_scores,
         score_observer=generated_scores.update,
     )
     if send:

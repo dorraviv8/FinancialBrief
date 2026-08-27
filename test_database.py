@@ -190,6 +190,26 @@ class SubscriberBackupTests(unittest.TestCase):
             calibrated["בנקים"]["horizons"][20]["sample_size"], 30
         )
 
+    def test_latest_sector_scores_supports_reader_change_summary(self):
+        with database.get_connection() as conn:
+            for trade_date, score in (("2026-08-25", 64), ("2026-08-26", 68)):
+                conn.execute(
+                    """
+                    INSERT INTO sector_score_predictions
+                        (trade_date, sector_name, graph_score, news_adjustment,
+                         calibration_adjustment, final_score, sector_close,
+                         benchmark_close, created_at)
+                    VALUES (?, 'בנקים', ?, 0, 0, ?, 100, 100, ?)
+                    """,
+                    (trade_date, score, score, trade_date),
+                )
+            conn.commit()
+
+        latest = database.get_latest_sector_scores()
+
+        self.assertEqual(latest["בנקים"]["trade_date"], "2026-08-26")
+        self.assertEqual(latest["בנקים"]["final_score"], 68)
+
 
 if __name__ == "__main__":
     unittest.main()

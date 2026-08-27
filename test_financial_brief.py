@@ -395,6 +395,99 @@ class IsraelMarketTests(unittest.TestCase):
             "SCORE|טכנולוגיה|2|סיבה\n### סעיף\nתוכן"
         ))
 
+    def test_reader_email_prioritizes_changes_and_limits_sector_detail(self):
+        trend = {
+            "available": True,
+            "as_of": "2026-08-26",
+            "return_20d_pct": 2,
+            "return_3m_pct": 5,
+            "above_sma_20": True,
+            "above_sma_50": True,
+            "above_sma_200": False,
+            "rsi_14": 55,
+            "macd_histogram": 1,
+            "directional_bias": "חיובית",
+        }
+        sector_names = ["בנקים", "ביטוח", "ביומד", "טכנולוגיה"]
+        data = {
+            "indices": {
+                name: {
+                    "last_value": 2000,
+                    "change_1d_pct": 0.5,
+                    "trend": trend,
+                    "chart_source": f"https://example.com/{name}",
+                }
+                for name in ("ת״א-35", "ת״א-90", "ת״א-125")
+            },
+            "sectors": {},
+        }
+        for name in sector_names:
+            data["sectors"][name] = {
+                "change_1d_pct": 0.3,
+                "trend": dict(trend),
+                "chart_source": f"https://example.com/sector/{name}",
+                "top_stocks_by_market_cap": [
+                    {
+                        "name": f"מניה {index}",
+                        "symbol": f"S{index}",
+                        "change_1d_pct": index,
+                        "technical_analysis": {"return_20d_pct": index + 1},
+                        "chart_source": f"https://example.com/stock/{index}",
+                    }
+                    for index in range(1, 4)
+                ],
+            }
+        scores = {
+            name: {
+                "final_score": score,
+                "label": "חזקה" if score >= 70 else "חלשה",
+                "graph_score": score,
+                "news_adjustment": 0,
+                "calibration_adjustment": 0,
+                "reason": "לא זוהתה השפעת חדשות.",
+            }
+            for name, score in zip(sector_names, (80, 70, 60, 30))
+        }
+        previous = {
+            name: {
+                "final_score": score - (4 if name == "בנקים" else 0),
+                "graph_score": score - (4 if name == "בנקים" else 0),
+                "news_adjustment": 0,
+                "calibration_adjustment": 0,
+            }
+            for name, score in zip(sector_names, (80, 70, 60, 30))
+        }
+
+        dashboard = financial_brief.build_reader_dashboard(scores, previous)
+        cards = financial_brief.build_reader_quantitative_cards(
+            data, scores, previous_scores=previous
+        )
+
+        self.assertIn("בנקים: 80/100 (+4)", dashboard)
+        self.assertIn("דירוג כל הסקטורים", cards)
+        self.assertEqual(cards.count("#### "), 3)
+        self.assertNotIn("#### טכנולוגיה", cards)
+        self.assertIn("כל הנתונים מתייחסים לסגירת 26.08.2026", cards)
+
+    def test_reader_context_hides_immaterial_currency_noise(self):
+        card = financial_brief.build_reader_context_card(
+            {
+                "indices": {},
+                "exchange_rates": {
+                    "rates": {
+                        "USD": {"change_pct": 0.1},
+                        "EUR": {"change_pct": -0.2},
+                    }
+                },
+                "maya_announcements": [],
+                "news": [],
+            },
+            {"בנקים": {"news_adjustment": 0}},
+        )
+
+        self.assertIn("לא נרשמה תנועה יומית של 0.5%", card)
+        self.assertNotIn("USD/ILS +0.10%", card)
+
     def test_source_context_cards_include_official_and_press_sources(self):
         cards = financial_brief.build_source_context_cards({
             "exchange_rates": {
@@ -435,7 +528,7 @@ class IsraelMarketTests(unittest.TestCase):
             "### סקטורים בולטים ותובנות AI\nתובנה\n### מבט סקטוריאלי להמשך\nתחזית",
         ]
 
-        financial_brief.generate_hebrew_brief({"indices": {}, "sectors": {}})
+        brief = financial_brief.generate_hebrew_brief({"indices": {}, "sectors": {}})
 
         self.assertEqual(mock_completion.call_count, 2)
         self.assertEqual(mock_completion.call_args_list[0].kwargs["max_tokens"], 1200)
@@ -448,6 +541,10 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertIn("SCORE|שם הסקטור", sector_prompt)
         self.assertIn("בין 10- ל-10+ בלבד", sector_prompt)
         self.assertIn("historical_calibration_adjustment", sector_prompt)
+        self.assertLess(
+            brief.index("### מה השתנה ומה חשוב הבוקר"),
+            brief.index("### דירוג כל הסקטורים"),
+        )
         mock_groq.return_value.models.list.assert_not_called()
 
     def test_html_email_escapes_ai_html_and_renders_markdown_links(self):

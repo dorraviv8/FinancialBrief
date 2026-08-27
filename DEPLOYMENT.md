@@ -26,6 +26,12 @@ The cache refreshes index constituent metadata once daily. It fetches all graph 
 reconciliation. Other mornings fetch only the newest page and merge it into
 the cached one-year series. A second run on the same day reuses the cache.
 
+The same persistent SQLite database stores compact sector-score predictions,
+official sector/TA-125 closes, and their realized 10/20/30-session outcomes.
+The email displays historical results after 20 comparable completed cases and
+permits a bounded calibration adjustment only after 30. Dry runs do not add
+predictions or outcomes.
+
 Never upload `.env` or `subscribers.db`. The repository `.rsync-filter` already
 excludes them.
 

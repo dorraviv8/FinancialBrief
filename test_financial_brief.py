@@ -182,6 +182,10 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertEqual(stocks[0]["market_cap_m_ils"], 900)
         self.assertEqual(stocks[0]["price_ils"], 12.0)
         self.assertEqual(result["breadth"], {"advancers": 2, "decliners": 1, "unchanged": 1})
+        self.assertEqual(result["history_closes"], [
+            {"date": "2026-08-01", "close": 100.0},
+            {"date": "2026-08-02", "close": 101.0},
+        ])
 
     def test_compact_sector_payload_keeps_only_required_analysis(self):
         data = {
@@ -361,19 +365,32 @@ class IsraelMarketTests(unittest.TestCase):
         }
         data = {"indices": {}, "sectors": {"טכנולוגיה": sector}}
 
+        calibration = {
+            "טכנולוגיה": {
+                "adjustment": -3,
+                "horizons": {
+                    10: {"sample_size": 20, "hit_rate_pct": 40, "avg_excess_return_pct": -1.2, "confidence": "ראשונית"},
+                    20: {"sample_size": 0},
+                    30: {"sample_size": 0},
+                },
+            }
+        }
         scores = financial_brief._parse_sector_scores(
             data,
             "SCORE|טכנולוגיה|99|כותרת חיובית שסופקה",
+            calibration,
         )
-        cards = financial_brief.build_quantitative_cards(data, scores)
+        cards = financial_brief.build_quantitative_cards(data, scores, calibration)
 
         self.assertEqual(scores["טכנולוגיה"]["news_adjustment"], 10)
         self.assertEqual(
             scores["טכנולוגיה"]["final_score"],
-            min(100, scores["טכנולוגיה"]["graph_score"] + 10),
+            min(100, scores["טכנולוגיה"]["graph_score"] + 10 - 3),
         )
         self.assertIn("ציון אטרקטיביות להשקעה כעת", cards)
         self.assertIn("השפעת החדשות: +10 נקודות", cards)
+        self.assertIn("כיול היסטורי: -3 נקודות", cards)
+        self.assertIn("עקפו את ת״א-125 ב-40.0%", cards)
         self.assertNotIn("SCORE|", financial_brief._strip_score_protocol(
             "SCORE|טכנולוגיה|2|סיבה\n### סעיף\nתוכן"
         ))
@@ -430,6 +447,7 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertIn("אסור להשתמש בלי הסבר", market_prompt)
         self.assertIn("SCORE|שם הסקטור", sector_prompt)
         self.assertIn("בין 10- ל-10+ בלבד", sector_prompt)
+        self.assertIn("historical_calibration_adjustment", sector_prompt)
         mock_groq.return_value.models.list.assert_not_called()
 
     def test_html_email_escapes_ai_html_and_renders_markdown_links(self):

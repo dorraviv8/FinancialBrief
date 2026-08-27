@@ -126,12 +126,19 @@ def _compact_sector_payload(data: dict, selected_names: list[str] | None = None)
     }
 
 
-def _compact_sector_overview(data: dict) -> dict:
+def _compact_sector_overview(
+    data: dict,
+    calibration: dict | None = None,
+) -> dict:
+    calibration = calibration or {}
     return {
         "as_of": data.get("as_of"),
         "sectors": {
             name: {
                 "graph_score_0_100": calculate_sector_graph_score(sector),
+                "historical_calibration_adjustment": calibration.get(name, {}).get(
+                    "adjustment", 0
+                ),
                 "change_1d_pct": sector.get("change_1d_pct"),
                 "breadth": sector.get("breadth"),
                 "trend": _compact_technical(sector.get("trend")),
@@ -247,7 +254,12 @@ def _sector_score_label(score: int) -> str:
     return "חלשה"
 
 
-def _parse_sector_scores(data: dict, ai_text: str) -> dict:
+def _parse_sector_scores(
+    data: dict,
+    ai_text: str,
+    calibration: dict | None = None,
+) -> dict:
+    calibration = calibration or {}
     adjustments = {}
     for line in ai_text.splitlines():
         if not line.startswith("SCORE|"):
@@ -272,14 +284,20 @@ def _parse_sector_scores(data: dict, ai_text: str) -> dict:
     for name, sector in data.get("sectors", {}).items():
         graph_score = calculate_sector_graph_score(sector)
         adjustment = adjustments.get(name, {}).get("news_adjustment", 0)
+        calibration_adjustment = int(
+            _clamp(calibration.get(name, {}).get("adjustment", 0), -5, 5)
+        )
         reason = adjustments.get(name, {}).get("reason") or (
             "לא זוהתה בכותרות שסופקו השפעת חדשות ענפית מהותית; "
             "הציון נשען על נתוני הגרף."
         )
-        final_score = int(round(_clamp(graph_score + adjustment)))
+        final_score = int(round(_clamp(
+            graph_score + adjustment + calibration_adjustment
+        )))
         scores[name] = {
             "graph_score": graph_score,
             "news_adjustment": adjustment,
+            "calibration_adjustment": calibration_adjustment,
             "final_score": final_score,
             "label": _sector_score_label(final_score),
             "reason": reason,
@@ -463,12 +481,38 @@ def _sector_chart_summary(technical: dict) -> list[str]:
     ]
 
 
+def _sector_calibration_summary(calibration: dict | None) -> str:
+    calibration = calibration or {}
+    horizon_labels = {10: "שבועיים", 20: "4 שבועות", 30: "6 שבועות"}
+    parts = []
+    for horizon in (10, 20, 30):
+        stats = calibration.get("horizons", {}).get(horizon, {})
+        sample_size = int(stats.get("sample_size") or 0)
+        if sample_size < database.CALIBRATION_MIN_DISPLAY_CASES:
+            parts.append(
+                f"{horizon_labels[horizon]}: {sample_size} מקרים שהושלמו; "
+                f"דרושים לפחות "
+                f"{database.CALIBRATION_MIN_DISPLAY_CASES} להצגת תוצאה"
+            )
+            continue
+        parts.append(
+            f"{horizon_labels[horizon]}: סקטורים עם ציון דומה עקפו את ת״א-125 ב-"
+            f"{_format_number(stats.get('hit_rate_pct'), 1)}% מתוך {sample_size} מקרים; "
+            f"תשואה עודפת ממוצעת "
+            f"{_format_pct(stats.get('avg_excess_return_pct'))}; "
+            f"רמת ביטחון {stats.get('confidence')}"
+        )
+    return "; ".join(parts) + "."
+
+
 def build_quantitative_cards(
     data: dict,
     sector_scores: dict | None = None,
+    calibration: dict | None = None,
 ) -> str:
     """Build complete Hebrew chart cards independently of AI output limits."""
     sector_scores = sector_scores or _parse_sector_scores(data, "")
+    calibration = calibration or {}
     sections = []
     for name in ("ת״א-35", "ת״א-90", "ת״א-125"):
         index = data.get("indices", {}).get(name, {})
@@ -490,6 +534,7 @@ def build_quantitative_cards(
             "### איך לקרוא את ציוני הסקטורים\n"
             "- **מה הציון מודד:** אטרקטיביות יחסית להשקעה כעת, באופק של 2–6 שבועות ובגישה מאוזנת.\n"
             "- **איך הוא מחושב:** ציון גרף של 0–100 המבוסס על תשואות, ממוצעי מחיר, רוחב, עוצמת התנועה ותנודתיות; ה-AI רשאי להוסיף או להפחית עד 10 נקודות רק בגלל חדשות ישראליות שסופקו למערכת.\n"
+            "- **כיול על פי תוצאות אמת:** המערכת משווה כל ציון לתשואה העודפת של הסקטור מול ת״א-125 לאחר 2, 4 ו-6 שבועות. הכיול מוגבל ל-5± נקודות ומופעל רק לאחר 30 מקרים דומים שהושלמו.\n"
             "- **פירוש מהיר:** 85–100 חזקה מאוד; 70–84 חזקה; 55–69 חיובית בזהירות; 40–54 ניטרלית; מתחת ל-40 חלשה.\n"
             "- **חשוב:** זהו כלי השוואתי ולא הבטחת תשואה או המלצת השקעה אישית."
         )
@@ -499,8 +544,11 @@ def build_quantitative_cards(
         score = sector_scores[name]
         lines = [
             f"- **ציון אטרקטיביות להשקעה כעת: {score['final_score']}/100 – {score['label']}.** "
-            f"ציון הגרף: {score['graph_score']}/100; השפעת החדשות: {score['news_adjustment']:+d} נקודות. "
+            f"ציון הגרף: {score['graph_score']}/100; השפעת החדשות: {score['news_adjustment']:+d} נקודות; "
+            f"כיול היסטורי: {score.get('calibration_adjustment', 0):+d} נקודות. "
             f"{score['reason']}",
+            "- **בדיקת הציון מול תוצאות אמת:** "
+            + _sector_calibration_summary(calibration.get(name)),
             f"- **מדד הסקטור:** רמה {_format_number(sector.get('last_value'))}; שינוי יומי {_format_pct(sector.get('change_1d_pct'))}; "
             f"רוחב: {_hebrew_count(breadth.get('advancers'), 'עולה', 'עולות')}, "
             f"{_hebrew_count(breadth.get('decliners'), 'יורדת', 'יורדות')} ו-"
@@ -618,7 +666,11 @@ def _require_ai_sections(text: str, required_titles: tuple[str, ...]) -> None:
         raise RuntimeError("AI response missing required sections: " + ", ".join(missing))
 
 
-def generate_hebrew_brief(data: dict) -> str:
+def generate_hebrew_brief(
+    data: dict,
+    calibration: dict | None = None,
+    score_observer=None,
+) -> str:
     """Generate fact-grounded Israeli index and sector analysis in bounded calls."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is required to generate the briefing")
@@ -655,7 +707,7 @@ def generate_hebrew_brief(data: dict) -> str:
 {market_data}"""
 
     sector_overview = json.dumps(
-        _compact_sector_overview(data),
+        _compact_sector_overview(data, calibration),
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -666,12 +718,12 @@ def generate_hebrew_brief(data: dict) -> str:
     )
     sector_prompt = f"""אתה אנליסט סקטורים של הבורסה בתל אביב. כתוב בעברית תקנית, קצרה וברורה.
 
-לכל סקטור כבר חושב graph_score_0_100 שקוף לפי ביצועי חודש/3/6/12 חודשים, רוחב, תנודתיות, ממוצעי מחיר, RSI, MACD ומגמה. נתח את כותרות החדשות הישראליות שסופקו וקבע news_adjustment בין 10- ל-10+ בלבד. אם אין כותרת שקשורה ישירות לסקטור או לאחת המניות הגדולות בו, ההתאמה חייבת להיות 0. אל תשתמש בידע חיצוני ואל תמציא קשר סיבתי.
+לכל סקטור כבר חושב graph_score_0_100 שקוף לפי ביצועי חודש/3/6/12 חודשים, רוחב, תנודתיות, ממוצעי מחיר, RSI, MACD ומגמה. historical_calibration_adjustment הוא כיול מוגבל של 5± נקודות על סמך מקרים היסטוריים שהושלמו. נתח את כותרות החדשות הישראליות שסופקו וקבע news_adjustment בין 10- ל-10+ בלבד. אם אין כותרת שקשורה ישירות לסקטור או לאחת המניות הגדולות בו, ההתאמה חייבת להיות 0. אל תשתמש בידע חיצוני ואל תמציא קשר סיבתי.
 
 בתחילת התשובה כתוב בדיוק עשר שורות מכונה, אחת לכל סקטור ובשמות שסופקו, בפורמט הבא וללא Markdown:
 SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10+|הסבר עברי קצר שמציין את החדשה או שאין חדשות מהותיות
 
-הציון הסופי הוא graph_score_0_100 ועוד התאמת החדשות, מוגבל ל-0–100. לאחר עשר שורות SCORE, דרג את הסקטורים לפי הציון הסופי.
+הציון הסופי הוא graph_score_0_100 ועוד התאמת החדשות ועוד historical_calibration_adjustment, מוגבל ל-0–100. לאחר עשר שורות SCORE, דרג את הסקטורים לפי הציון הסופי.
 
 כתוב לאחר שורות המכונה עד 220 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
 ### סקטורים בולטים ותובנות AI
@@ -707,9 +759,11 @@ SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10
         sector_brief_raw,
         ("סקטורים בולטים ותובנות AI", "מבט סקטוריאלי להמשך"),
     )
-    sector_scores = _parse_sector_scores(data, sector_brief_raw)
+    sector_scores = _parse_sector_scores(data, sector_brief_raw, calibration)
+    if score_observer is not None:
+        score_observer(sector_scores)
     sector_brief = _strip_score_protocol(sector_brief_raw)
-    quantitative_cards = build_quantitative_cards(data, sector_scores)
+    quantitative_cards = build_quantitative_cards(data, sector_scores, calibration)
     source_cards = build_source_context_cards(data)
     return "\n\n".join([market_brief, quantitative_cards, sector_brief, source_cards])
 
@@ -904,11 +958,35 @@ def run(send: bool = True, include_news: bool = True) -> dict:
 
     data = collect_israeli_market_data(include_news=include_news)
     validate_market_data(data)
-    brief_text = generate_hebrew_brief(data)
+    tracking = {
+        "close_rows_upserted": 0,
+        "outcomes_settled": 0,
+        "predictions_upserted": 0,
+    }
+    if send:
+        tracking.update(database.record_market_close_history(data))
+        tracking.update(database.settle_sector_score_outcomes())
+
+    graph_scores = {
+        name: calculate_sector_graph_score(sector)
+        for name, sector in data.get("sectors", {}).items()
+    }
+    calibration = database.get_sector_score_calibration(graph_scores)
+    generated_scores = {}
+    brief_text = generate_hebrew_brief(
+        data,
+        calibration=calibration,
+        score_observer=generated_scores.update,
+    )
+    if send:
+        tracking.update(database.record_sector_score_predictions(
+            data, generated_scores
+        ))
     result = {
         "as_of": data.get("as_of"),
         "collection_stats": data.get("collection_stats", {}),
         "backup": backup_status,
+        "score_tracking": tracking,
         "subscriber_count": 0,
         "sent": 0,
         "failed": [],

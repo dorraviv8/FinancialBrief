@@ -601,6 +601,23 @@ def calculate_trend_metrics(history: list[dict]) -> dict:
     }
 
 
+def _history_close_series(history: list[dict]) -> list[dict]:
+    """Return a small, chronological close series for local score evaluation."""
+    points = {}
+    for row in history:
+        try:
+            trade_date = datetime.strptime(row["TradeDate"], "%d/%m/%Y").date()
+            close_value = float(row["CloseRate"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if close_value > 0:
+            points[trade_date.isoformat()] = round(close_value, 6)
+    return [
+        {"date": trade_date, "close": points[trade_date]}
+        for trade_date in sorted(points)
+    ]
+
+
 def _component_lookup(components: list[dict]) -> tuple[dict, dict]:
     by_symbol = {}
     by_number = {}
@@ -706,6 +723,9 @@ def build_index_analysis(
         },
         "top_5_weight_pct": round(sum(top_weights[:5]), 2),
         "trend": trend,
+        # Kept out of AI prompts; used locally to settle prior score predictions
+        # after exactly 10, 20 and 30 TASE trading sessions.
+        "history_closes": _history_close_series(history),
         "top_stocks_by_market_cap": top_stocks,
         "top_gainers": [
             _stock_summary(row)

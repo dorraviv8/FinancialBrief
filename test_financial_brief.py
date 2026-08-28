@@ -577,6 +577,96 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertIn("מבט להמשך", rendered)
         self.assertNotIn("פרופיל משקיע", rendered)
 
+    def test_delivery_run_reuses_brief_retries_failure_then_skips_duplicate(self):
+        fixed_now = datetime(
+            2026, 8, 28, 7, 0, tzinfo=financial_brief.ISRAEL_TZ
+        )
+        data = {
+            "as_of": "2026-08-28T06:55:00+03:00",
+            "indices": {
+                "ת״א-125": {"trend": {"as_of": "2026-08-27"}}
+            },
+            "sectors": {},
+            "collection_stats": {"network_requests": 1},
+        }
+
+        with TemporaryDirectory() as directory:
+            original_db_path = financial_brief.database.DB_PATH
+            financial_brief.database.DB_PATH = str(Path(directory) / "brief.db")
+            try:
+                financial_brief.database.init_db()
+                financial_brief.database.add_subscriber(
+                    "Reader", "reader@example.com"
+                )
+                with (
+                    patch.object(financial_brief, "OWNER_EMAIL", None),
+                    patch.object(financial_brief, "GMAIL_USER", "sender@example.com"),
+                    patch.object(financial_brief, "GMAIL_APP_PASSWORD", "secret"),
+                    patch.object(financial_brief, "_today", return_value=fixed_now),
+                    patch.object(
+                        financial_brief,
+                        "collect_israeli_market_data",
+                        return_value=data,
+                    ) as collect,
+                    patch.object(financial_brief, "validate_market_data"),
+                    patch.object(
+                        financial_brief,
+                        "generate_hebrew_brief",
+                        return_value="### בדיקה\nתוכן קבוע",
+                    ) as generate,
+                    patch.object(
+                        financial_brief,
+                        "send_email",
+                        side_effect=(RuntimeError("temporary SMTP failure"), None),
+                    ) as send,
+                ):
+                    first = financial_brief.run(send=True)
+                    second = financial_brief.run(send=True)
+                    third = financial_brief.run(send=True)
+
+                self.assertEqual(first["sent"], 0)
+                self.assertEqual(len(first["failed"]), 1)
+                self.assertEqual(first["delivery"]["status"], "partial")
+                self.assertTrue(second["reused_brief"])
+                self.assertEqual(second["sent"], 1)
+                self.assertEqual(second["delivery"]["status"], "completed")
+                self.assertTrue(third["reused_brief"])
+                self.assertEqual(third["sent"], 0)
+                self.assertEqual(
+                    third["skipped"][0]["reason"], "already_sent"
+                )
+                collect.assert_called_once_with(include_news=True)
+                generate.assert_called_once()
+                self.assertEqual(send.call_count, 2)
+                first_message_id = send.call_args_list[0].kwargs["message_id"]
+                second_message_id = send.call_args_list[1].kwargs["message_id"]
+                self.assertEqual(first_message_id, second_message_id)
+
+                with financial_brief.database.get_connection() as conn:
+                    run_count = conn.execute(
+                        "SELECT COUNT(*) FROM briefing_runs"
+                    ).fetchone()[0]
+                    delivery = conn.execute(
+                        "SELECT status, attempts FROM email_deliveries"
+                    ).fetchone()
+                self.assertEqual(run_count, 1)
+                self.assertEqual(delivery["status"], "sent")
+                self.assertEqual(delivery["attempts"], 2)
+            finally:
+                financial_brief.database.DB_PATH = original_db_path
+
+    def test_process_lock_rejects_overlapping_delivery(self):
+        with TemporaryDirectory() as directory, patch.dict(
+            "os.environ",
+            {"FINANCIAL_BRIEF_LOCK_PATH": str(Path(directory) / "brief.lock")},
+        ):
+            with financial_brief._delivery_process_lock():
+                with self.assertRaisesRegex(
+                    RuntimeError, "already running"
+                ):
+                    with financial_brief._delivery_process_lock():
+                        pass
+
 
 if __name__ == "__main__":
     unittest.main()

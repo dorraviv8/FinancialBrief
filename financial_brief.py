@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
 import html
 import json
 import os
@@ -38,6 +41,54 @@ MIN_STOCK_CHART_SESSIONS = 20
 
 def _today() -> datetime:
     return datetime.now(ISRAEL_TZ)
+
+
+def _delivery_lock_path() -> str:
+    configured = os.getenv("FINANCIAL_BRIEF_LOCK_PATH")
+    if configured:
+        return configured
+    return os.path.join(
+        os.path.dirname(os.path.abspath(database.DB_PATH)),
+        "financial-brief.lock",
+    )
+
+
+@contextmanager
+def _delivery_process_lock():
+    """Prevent scheduled and manual delivery processes from overlapping."""
+    lock_path = _delivery_lock_path()
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    handle = open(lock_path, "a", encoding="utf-8")
+    acquired = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "Another FinancialBrief delivery process is already running"
+            ) from exc
+        yield
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _daily_message_id(report_date: str, recipient_email: str) -> str:
+    """Return a stable RFC-style ID for one report/recipient delivery."""
+    normalized_email = recipient_email.strip().lower()
+    digest = hashlib.sha256(
+        f"{report_date}\0{normalized_email}".encode("utf-8")
+    ).hexdigest()[:24]
+    sender_domain = (
+        GMAIL_USER.rsplit("@", 1)[1]
+        if GMAIL_USER and "@" in GMAIL_USER
+        else "financialbrief.local"
+    )
+    return f"<financialbrief-{report_date}-{digest}@{sender_domain}>"
 
 
 def _compact_technical(technical: dict | None) -> dict:
@@ -1271,78 +1322,156 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
 </div></body></html>"""
 
 
-def send_email(html_content: str, subject: str, recipient_email: str) -> None:
+def send_email(
+    html_content: str,
+    subject: str,
+    recipient_email: str,
+    message_id: str | None = None,
+) -> None:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = GMAIL_USER
     msg["To"] = recipient_email
+    if message_id:
+        msg["Message-ID"] = message_id
     msg.attach(MIMEText(html_content, "html", "utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, recipient_email, msg.as_string())
 
 
-def run(send: bool = True, include_news: bool = True) -> dict:
+def run(
+    send: bool = True,
+    include_news: bool = True,
+    force_send: bool = False,
+) -> dict:
+    if force_send and not send:
+        raise ValueError("force_send requires email delivery")
+
     database.init_db()
     if OWNER_EMAIL:
         database.seed_owner(OWNER_NAME, OWNER_EMAIL)
     backup_status = database.snapshot_subscribers_once_daily()
 
-    data = collect_israeli_market_data(include_news=include_news)
-    validate_market_data(data)
+    if send and (not GMAIL_USER or not GMAIL_APP_PASSWORD):
+        raise RuntimeError("GMAIL_USER and GMAIL_APP_PASSWORD are required to send email")
+
+    report_date = _today().date().isoformat()
+    existing_run = database.get_briefing_run(report_date) if send else None
+    reused_brief = existing_run is not None
     tracking = {
         "close_rows_upserted": 0,
         "outcomes_settled": 0,
         "predictions_upserted": 0,
     }
-    if send:
-        tracking.update(database.record_market_close_history(data))
-        tracking.update(database.settle_sector_score_outcomes())
 
-    graph_scores = {
-        name: calculate_sector_graph_score(sector)
-        for name, sector in data.get("sectors", {}).items()
-    }
-    calibration = database.get_sector_score_calibration(graph_scores)
-    previous_scores = database.get_latest_sector_scores()
-    generated_scores = {}
-    brief_text = generate_hebrew_brief(
-        data,
-        calibration=calibration,
-        previous_scores=previous_scores,
-        score_observer=generated_scores.update,
-    )
-    if send:
-        tracking.update(database.record_sector_score_predictions(
-            data, generated_scores
-        ))
+    if existing_run:
+        brief_text = existing_run["brief_text"]
+        as_of = existing_run.get("as_of")
+        collection_stats = {}
+        briefing_run = existing_run
+    else:
+        data = collect_israeli_market_data(include_news=include_news)
+        validate_market_data(data)
+        if send:
+            tracking.update(database.record_market_close_history(data))
+            tracking.update(database.settle_sector_score_outcomes())
+
+        graph_scores = {
+            name: calculate_sector_graph_score(sector)
+            for name, sector in data.get("sectors", {}).items()
+        }
+        calibration = database.get_sector_score_calibration(graph_scores)
+        previous_scores = database.get_latest_sector_scores()
+        generated_scores = {}
+        brief_text = generate_hebrew_brief(
+            data,
+            calibration=calibration,
+            previous_scores=previous_scores,
+            score_observer=generated_scores.update,
+        )
+        if send:
+            tracking.update(database.record_sector_score_predictions(
+                data, generated_scores
+            ))
+            market_close_date = (
+                data.get("indices", {})
+                .get("ת״א-125", {})
+                .get("trend", {})
+                .get("as_of")
+            )
+            briefing_run = database.save_briefing_run(
+                report_date,
+                market_close_date,
+                data.get("as_of"),
+                brief_text,
+            )
+            # In the unlikely event of a concurrent insert, the ledger's
+            # immutable copy is the authoritative content to deliver.
+            brief_text = briefing_run["brief_text"]
+        else:
+            briefing_run = None
+        as_of = data.get("as_of")
+        collection_stats = data.get("collection_stats", {})
+
     result = {
-        "as_of": data.get("as_of"),
-        "collection_stats": data.get("collection_stats", {}),
+        "run_id": briefing_run["id"] if briefing_run else None,
+        "report_date": report_date,
+        "reused_brief": reused_brief,
+        "as_of": as_of,
+        "collection_stats": collection_stats,
         "backup": backup_status,
         "score_tracking": tracking,
         "subscriber_count": 0,
         "sent": 0,
         "failed": [],
+        "ambiguous": [],
+        "skipped": [],
         "brief": brief_text,
     }
     if not send:
         return result
 
-    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-        raise RuntimeError("GMAIL_USER and GMAIL_APP_PASSWORD are required to send email")
-
     subscribers = database.get_active_subscribers()
     result["subscriber_count"] = len(subscribers)
-    subject = f"תדריך שוק ההון הישראלי – {_today().strftime('%d/%m/%Y')}"
+    subject_date = datetime.strptime(report_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    subject = f"תדריך שוק ההון הישראלי – {subject_date}"
     for subscriber in subscribers:
+        email_address = subscriber["email"]
+        message_id = _daily_message_id(report_date, email_address)
+        claim = database.claim_email_delivery(
+            briefing_run["id"],
+            email_address,
+            message_id,
+            force=force_send,
+        )
+        if not claim["send"]:
+            result["skipped"].append({
+                "email": email_address,
+                "reason": claim["reason"],
+            })
+            continue
         try:
             unsubscribe_url = f"{BASE_URL}/unsubscribe/{subscriber['token']}"
             content = build_html_email(brief_text, unsubscribe_url)
-            send_email(content, subject, subscriber["email"])
+            send_email(content, subject, email_address, message_id=message_id)
+        except Exception as exc:
+            database.mark_email_delivery_failed(
+                briefing_run["id"], email_address, str(exc)
+            )
+            result["failed"].append({"email": email_address, "error": str(exc)})
+            continue
+        try:
+            database.mark_email_delivery_sent(briefing_run["id"], email_address)
             result["sent"] += 1
         except Exception as exc:
-            result["failed"].append({"email": subscriber["email"], "error": str(exc)})
+            # SMTP has already accepted the message. Keep the row in `sending`
+            # so a normal retry cannot risk delivering a duplicate.
+            result["ambiguous"].append({
+                "email": email_address,
+                "error": f"SMTP accepted; ledger update failed: {exc}",
+            })
+    result["delivery"] = database.finalize_briefing_run(briefing_run["id"])
     return result
 
 
@@ -1350,12 +1479,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Israeli stock-market morning briefing")
     parser.add_argument("--dry-run", action="store_true", help="Generate but do not send email")
     parser.add_argument(
+        "--force-send",
+        action="store_true",
+        help="Intentionally resend today's persisted report to active recipients",
+    )
+    parser.add_argument(
         "--collect-only",
         action="store_true",
         help="Validate sources without AI generation, database writes, or email",
     )
     parser.add_argument("--no-news", action="store_true", help="Skip press feeds during diagnostics")
     args = parser.parse_args()
+    if args.force_send and (args.dry_run or args.collect_only):
+        parser.error("--force-send cannot be combined with --dry-run or --collect-only")
     if args.collect_only:
         data = collect_israeli_market_data(include_news=not args.no_news)
         validate_market_data(data)
@@ -1386,7 +1522,15 @@ def main() -> None:
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
-    result = run(send=not args.dry_run, include_news=not args.no_news)
+    if args.dry_run:
+        result = run(send=False, include_news=not args.no_news)
+    else:
+        with _delivery_process_lock():
+            result = run(
+                send=True,
+                include_news=not args.no_news,
+                force_send=args.force_send,
+            )
     printable = {key: value for key, value in result.items() if key != "brief"}
     print(json.dumps(printable, ensure_ascii=False, indent=2))
     if args.dry_run:

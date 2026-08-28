@@ -32,14 +32,24 @@ The email displays historical results after 20 comparable completed cases and
 permits a bounded calibration adjustment only after 30. Dry runs do not add
 predictions or outcomes.
 
+It also stores one immutable briefing per Israel calendar date and a delivery
+record for every recipient. Normal reruns reuse the persisted briefing, retry
+explicitly failed recipients, and skip addresses already marked as sent. A
+process lock next to the database prevents scheduled and manual send commands
+from overlapping. If an operator intentionally needs to resend today's report,
+use `python financial_brief.py --force-send`; this override should not be part of
+the timer unit.
+
 Never upload `.env` or `subscribers.db`. The repository `.rsync-filter` already
 excludes them.
 
 ## Morning schedule
 
 The example systemd service and timer in `deploy/` run the briefing every day at
-07:00 in the `Asia/Jerusalem` timezone. The service sends the email once and
-exits. `Persistent=true` allows a missed run to execute after a VM restart.
+07:00 in the `Asia/Jerusalem` timezone. The service safely delivers each daily
+briefing at most once per recipient and exits. `Persistent=true` allows a missed
+run to execute after a VM restart without duplicating an already completed
+delivery.
 
 Before deployment, replace `YOUR_GCP_USER`. The web unit binds only to the
 private Docker gateway (`172.18.0.1:5001`) and Caddy publishes the app below

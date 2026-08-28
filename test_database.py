@@ -210,6 +210,74 @@ class SubscriberBackupTests(unittest.TestCase):
         self.assertEqual(latest["בנקים"]["trade_date"], "2026-08-26")
         self.assertEqual(latest["בנקים"]["final_score"], 68)
 
+    def test_delivery_claim_is_idempotent_forceable_and_retryable(self):
+        briefing_run = database.save_briefing_run(
+            "2026-08-28",
+            "2026-08-27",
+            "2026-08-28T07:00:00+03:00",
+            "### דוח\nתוכן",
+        )
+        message_id = "<daily-test@example.com>"
+
+        first = database.claim_email_delivery(
+            briefing_run["id"], "Reader@Example.com", message_id
+        )
+        database.mark_email_delivery_sent(
+            briefing_run["id"], "reader@example.com"
+        )
+        duplicate = database.claim_email_delivery(
+            briefing_run["id"], "reader@example.com", message_id
+        )
+        forced = database.claim_email_delivery(
+            briefing_run["id"], "reader@example.com", message_id, force=True
+        )
+        database.mark_email_delivery_failed(
+            briefing_run["id"], "reader@example.com", "temporary SMTP failure"
+        )
+        retry = database.claim_email_delivery(
+            briefing_run["id"], "reader@example.com", message_id
+        )
+        database.mark_email_delivery_sent(
+            briefing_run["id"], "reader@example.com"
+        )
+        final = database.finalize_briefing_run(briefing_run["id"])
+
+        self.assertTrue(first["send"])
+        self.assertEqual(first["attempt"], 1)
+        self.assertFalse(duplicate["send"])
+        self.assertEqual(duplicate["reason"], "already_sent")
+        self.assertTrue(forced["send"])
+        self.assertEqual(forced["reason"], "forced")
+        self.assertTrue(retry["send"])
+        self.assertEqual(retry["attempt"], 3)
+        self.assertEqual(retry["reason"], "retry_failed")
+        self.assertEqual(final["status"], "completed")
+        with database.get_connection() as conn:
+            delivery = conn.execute(
+                "SELECT status, attempts, message_id FROM email_deliveries"
+            ).fetchone()
+        self.assertEqual(delivery["status"], "sent")
+        self.assertEqual(delivery["attempts"], 3)
+        self.assertEqual(delivery["message_id"], message_id)
+
+    def test_ambiguous_in_progress_delivery_is_not_automatically_retried(self):
+        briefing_run = database.save_briefing_run(
+            "2026-08-28", None, None, "### דוח\nתוכן"
+        )
+
+        first = database.claim_email_delivery(
+            briefing_run["id"], "reader@example.com", "<test@example.com>"
+        )
+        second = database.claim_email_delivery(
+            briefing_run["id"], "reader@example.com", "<test@example.com>"
+        )
+
+        self.assertTrue(first["send"])
+        self.assertFalse(second["send"])
+        self.assertEqual(
+            second["reason"], "delivery_in_progress_or_ambiguous"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

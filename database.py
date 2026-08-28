@@ -7,6 +7,7 @@ import sqlite3
 import secrets
 import json
 import os
+import hashlib
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -121,6 +122,39 @@ def init_db():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_sector_predictions_score
             ON sector_score_predictions (final_score, sector_name)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS briefing_runs (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_date       TEXT UNIQUE NOT NULL,
+                market_close_date TEXT,
+                as_of             TEXT,
+                content_hash      TEXT NOT NULL,
+                brief_text        TEXT NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'ready',
+                created_at        TEXT NOT NULL,
+                updated_at        TEXT NOT NULL,
+                completed_at      TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS email_deliveries (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          INTEGER NOT NULL,
+                recipient_email TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                message_id      TEXT NOT NULL,
+                last_error      TEXT,
+                claimed_at      TEXT,
+                sent_at         TEXT,
+                UNIQUE (run_id, recipient_email),
+                FOREIGN KEY (run_id) REFERENCES briefing_runs(id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_email_deliveries_status
+            ON email_deliveries (run_id, status)
         """)
         conn.commit()
 
@@ -407,6 +441,177 @@ def get_latest_sector_scores() -> dict:
             """
         ).fetchall()
     return {row["sector_name"]: dict(row) for row in rows}
+
+
+# ── Idempotent Briefing Delivery ───────────────────────────────────────────────
+
+def get_briefing_run(report_date: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM briefing_runs WHERE report_date = ?",
+            (report_date,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_briefing_run(
+    report_date: str,
+    market_close_date: str | None,
+    as_of: str | None,
+    brief_text: str,
+) -> dict:
+    """Persist one immutable generated briefing per Israel report date."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    content_hash = hashlib.sha256(brief_text.encode("utf-8")).hexdigest()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO briefing_runs
+                (report_date, market_close_date, as_of, content_hash,
+                 brief_text, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'ready', ?, ?)
+            ON CONFLICT(report_date) DO NOTHING
+            """,
+            (
+                report_date,
+                market_close_date,
+                as_of,
+                content_hash,
+                brief_text,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM briefing_runs WHERE report_date = ?",
+            (report_date,),
+        ).fetchone()
+    return dict(row)
+
+
+def claim_email_delivery(
+    run_id: int,
+    recipient_email: str,
+    message_id: str,
+    force: bool = False,
+) -> dict:
+    """Atomically claim a recipient unless this run was already delivered."""
+    email = recipient_email.strip().lower()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT status, attempts
+            FROM email_deliveries
+            WHERE run_id = ? AND recipient_email = ?
+            """,
+            (run_id, email),
+        ).fetchone()
+        if row is None:
+            attempt = 1
+            conn.execute(
+                """
+                INSERT INTO email_deliveries
+                    (run_id, recipient_email, status, attempts,
+                     message_id, claimed_at)
+                VALUES (?, ?, 'sending', ?, ?, ?)
+                """,
+                (run_id, email, attempt, message_id, now),
+            )
+            conn.commit()
+            return {"send": True, "attempt": attempt, "reason": "new"}
+
+        if row["status"] == "sent" and not force:
+            conn.commit()
+            return {"send": False, "attempt": row["attempts"], "reason": "already_sent"}
+        if row["status"] == "sending" and not force:
+            conn.commit()
+            return {
+                "send": False,
+                "attempt": row["attempts"],
+                "reason": "delivery_in_progress_or_ambiguous",
+            }
+
+        attempt = int(row["attempts"] or 0) + 1
+        conn.execute(
+            """
+            UPDATE email_deliveries
+            SET status = 'sending', attempts = ?, message_id = ?,
+                last_error = NULL, claimed_at = ?, sent_at = NULL
+            WHERE run_id = ? AND recipient_email = ?
+            """,
+            (attempt, message_id, now, run_id, email),
+        )
+        conn.commit()
+    return {
+        "send": True,
+        "attempt": attempt,
+        "reason": "forced" if force else "retry_failed",
+    }
+
+
+def mark_email_delivery_sent(run_id: int, recipient_email: str) -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE email_deliveries
+            SET status = 'sent', sent_at = ?, last_error = NULL
+            WHERE run_id = ? AND recipient_email = ?
+            """,
+            (now, run_id, recipient_email.strip().lower()),
+        )
+        conn.commit()
+
+
+def mark_email_delivery_failed(
+    run_id: int,
+    recipient_email: str,
+    error: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE email_deliveries
+            SET status = 'failed', last_error = ?
+            WHERE run_id = ? AND recipient_email = ?
+            """,
+            (str(error)[:1000], run_id, recipient_email.strip().lower()),
+        )
+        conn.commit()
+
+
+def finalize_briefing_run(run_id: int) -> dict:
+    """Update aggregate run status from persistent recipient outcomes."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM email_deliveries WHERE run_id = ? GROUP BY status
+            """,
+            (run_id,),
+        ).fetchall()
+        counts = {row["status"]: row["count"] for row in rows}
+        if counts.get("failed"):
+            status = "partial"
+        elif counts.get("sending"):
+            status = "sending"
+        else:
+            status = "completed"
+        conn.execute(
+            """
+            UPDATE briefing_runs
+            SET status = ?, updated_at = ?,
+                completed_at = CASE WHEN ? = 'completed' THEN ? ELSE completed_at END
+            WHERE id = ?
+            """,
+            (status, now, status, now, run_id),
+        )
+        conn.commit()
+    return {"status": status, "delivery_counts": counts}
 
 
 def settle_sector_score_outcomes() -> dict:

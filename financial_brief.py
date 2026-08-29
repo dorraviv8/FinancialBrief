@@ -22,7 +22,8 @@ from groq import Groq
 
 import database
 import recommendation_v2
-from israel_market import collect_israeli_market_data
+import weekly_report
+from israel_market import collect_israeli_market_data, get_boi_exchange_rate_history
 
 
 load_dotenv()
@@ -265,6 +266,13 @@ def _compact_sector_news(data: dict) -> list[dict]:
 def _parse_published_time(value) -> datetime | None:
     if not value:
         return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ISRAEL_TZ)
+        return parsed.astimezone(ISRAEL_TZ)
+    except (TypeError, ValueError):
+        return None
 
 
 SECTOR_NEWS_KEYWORDS = {
@@ -317,13 +325,6 @@ def _news_item_relevant_to_sector(data: dict, sector_name: str, item: dict) -> b
             if len(normalized) >= 4 and normalized in haystack:
                 return True
     return False
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=ISRAEL_TZ)
-        return parsed.astimezone(ISRAEL_TZ)
-    except (TypeError, ValueError):
-        return None
 
 
 def _parse_news_catalysts(data: dict, ai_text: str) -> dict:
@@ -1603,6 +1604,70 @@ CATALYST|שם הסקטור|מזהה חדשות כגון M0/N2 או NONE|סוג �
     ])
 
 
+def _temporary_weekly_news(
+    data: dict,
+    existing: list[dict],
+    window_start,
+    window_end,
+) -> list[dict]:
+    """Merge current source results into a dry-run without mutating the ledger."""
+    merged = list(existing)
+    fingerprints = {
+        (str(item.get("source") or ""), _normalized_relevance_text(item.get("title")))
+        for item in merged
+    }
+    next_id = 900_000
+    for item in data.get("maya_announcements", []) + data.get("news", []):
+        published = _parse_published_time(item.get("published"))
+        if published and not (window_start <= published.date() <= window_end):
+            continue
+        key = (str(item.get("source") or ""), _normalized_relevance_text(item.get("title")))
+        if not key[1] or key in fingerprints:
+            continue
+        merged.append({**item, "id": next_id})
+        fingerprints.add(key)
+        next_id += 1
+    return merged
+
+
+def generate_weekly_hebrew_brief(
+    data: dict,
+    report_date,
+    fx_rates: dict,
+    news_items: list[dict],
+) -> tuple[str, dict, dict]:
+    """Generate one bounded weekly editorial pass over deterministic metrics."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is required to generate the weekly briefing")
+    snapshot = weekly_report.build_weekly_snapshot(data, report_date)
+    client = Groq(
+        api_key=GROQ_API_KEY,
+        timeout=GROQ_TIMEOUT_SECONDS,
+        max_retries=1,
+    )
+    response = _groq_completion(
+        client,
+        GROQ_MODEL,
+        weekly_report.weekly_ai_prompt(snapshot, fx_rates, news_items),
+        max_tokens=1800,
+        purpose="weekly-summary",
+    )
+    analysis = weekly_report.parse_weekly_ai_response(
+        data, snapshot, news_items, response
+    )
+    brief = weekly_report.build_weekly_brief(data, snapshot, fx_rates, analysis)
+    metadata = {
+        "window_start": snapshot["window_start"],
+        "window_end": snapshot["window_end"],
+        "selected_news_ids": [
+            int(item["id"])
+            for item in analysis.get("selected_news", [])
+            if int(item["id"]) < 900_000
+        ],
+    }
+    return brief, metadata, snapshot
+
+
 def _render_inline_markdown(text: str) -> str:
     escaped = html.escape(text, quote=False)
     escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
@@ -1711,9 +1776,18 @@ def _render_markdown_block(text: str) -> str:
     return "".join(rendered)
 
 
-def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
+def build_html_email(
+    brief_text: str,
+    unsubscribe_url: str = "#",
+    report_type: str = "daily",
+) -> str:
     now = _today()
     date_str = now.strftime("%d/%m/%Y")
+    report_title = (
+        "סיכום שבועי — שוק ההון הישראלי"
+        if report_type == "weekly"
+        else "תדריך שוק ההון הישראלי"
+    )
     normalized = re.sub(r"(?m)^\s*#{1,2}\s+###\s+", "### ", brief_text.strip())
     headings = list(re.finditer(r"(?m)^\s*###\s+(.+?)\s*$", normalized))
     cards = []
@@ -1736,7 +1810,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>תדריך שוק ההון הישראלי – {date_str}</title>
+  <title>{report_title} – {date_str}</title>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family:Arial,"Noto Sans Hebrew",sans-serif; background:#e8edf4; color:#1e2d42; direction:rtl; text-align:right; }}
@@ -1764,7 +1838,7 @@ def build_html_email(brief_text: str, unsubscribe_url: str = "#") -> str:
   </style>
 </head>
 <body dir="rtl" align="right"><div class="wrapper" dir="rtl" align="right">
-  <div class="header"><div class="logo">ISRAEL MARKET INTELLIGENCE</div><h1>תדריך שוק ההון הישראלי</h1><div class="date">{date_str}</div></div>
+  <div class="header"><div class="logo">ISRAEL MARKET INTELLIGENCE</div><h1>{report_title}</h1><div class="date">{date_str}</div></div>
   <div class="accent"></div>
   {''.join(cards)}
   <div class="notice">התחזיות בתדריך הן תרחישים המבוססים על נתוני עבר ומידע ציבורי. הן אינן הבטחת תשואה, המלצה אישית או תחליף לייעוץ השקעות מורשה.</div>
@@ -1796,6 +1870,7 @@ def run(
     send: bool = True,
     include_news: bool = True,
     force_send: bool = False,
+    report_type: str | None = None,
 ) -> dict:
     if force_send and not send:
         raise ValueError("force_send requires email delivery")
@@ -1808,7 +1883,13 @@ def run(
     if send and (not GMAIL_USER or not GMAIL_APP_PASSWORD):
         raise RuntimeError("GMAIL_USER and GMAIL_APP_PASSWORD are required to send email")
 
-    report_date = _today().date().isoformat()
+    now = _today()
+    resolved_report_type = report_type or (
+        "weekly" if now.weekday() == 6 else "daily"
+    )
+    if resolved_report_type not in {"daily", "weekly"}:
+        raise ValueError("report_type must be 'daily' or 'weekly'")
+    report_date = now.date().isoformat()
     existing_run = database.get_briefing_run(report_date) if send else None
     reused_brief = existing_run is not None
     tracking = {
@@ -1823,57 +1904,121 @@ def run(
     if existing_run:
         brief_text = existing_run["brief_text"]
         as_of = existing_run.get("as_of")
+        resolved_report_type = existing_run.get("report_type") or resolved_report_type
+        try:
+            report_metadata = json.loads(existing_run.get("metadata_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            report_metadata = {}
         collection_stats = {}
         briefing_run = existing_run
     else:
-        data = collect_israeli_market_data(include_news=include_news)
+        collection_options = {"include_news": include_news}
+        if resolved_report_type == "weekly":
+            collection_options.update({
+                "news_hours": 192,
+                "news_per_source": 8,
+                "news_limit": 60,
+            })
+        data = collect_israeli_market_data(**collection_options)
         validate_market_data(data)
         if send:
             tracking.update(database.record_market_close_history(data))
             tracking.update(database.settle_sector_score_outcomes())
             tracking.update(database.settle_v2_prediction_outcomes())
-
-        graph_scores = {
-            name: calculate_sector_graph_score(sector)
-            for name, sector in data.get("sectors", {}).items()
-        }
-        calibration = database.get_sector_score_calibration(graph_scores)
-        previous_scores = database.get_latest_sector_scores()
-        model_status = database.choose_active_recommendation_model(
-            os.getenv("RECOMMENDATION_V2_MODE", "shadow")
-        )
-        generated_scores = {}
-        recommendation_capture = {}
-        brief_text = generate_hebrew_brief(
-            data,
-            calibration=calibration,
-            previous_scores=previous_scores,
-            score_observer=generated_scores.update,
-            recommendation_observer=recommendation_capture.update,
-            model_status=model_status,
-        )
-        if send:
-            tracking.update(database.record_sector_score_predictions(
-                data, generated_scores
-            ))
-            if recommendation_capture.get("bundle"):
-                tracking.update(database.record_v2_recommendation_bundle(
-                    data,
-                    recommendation_capture["bundle"],
-                    generated_scores,
-                    model_status["active_model"],
+            tracking.update(database.record_fx_rates(data))
+            if include_news:
+                tracking.update(database.save_weekly_news(
+                    data.get("maya_announcements", []) + data.get("news", [])
                 ))
+
+        if resolved_report_type == "weekly":
+            preliminary = weekly_report.build_weekly_snapshot(data, now.date())
+            window_start = datetime.strptime(
+                preliminary["window_start"], "%Y-%m-%d"
+            ).date()
+            window_end = datetime.strptime(
+                preliminary["window_end"], "%Y-%m-%d"
+            ).date()
+            news_items = database.get_weekly_news(window_start, window_end)
+            if not send:
+                news_items = _temporary_weekly_news(
+                    data, news_items, window_start, window_end
+                )
+            stored_fx_rates = database.get_weekly_fx_rates(window_start, window_end)
+            try:
+                official_fx_history = get_boi_exchange_rate_history(
+                    window_start, window_end
+                )
+                fx_rates = weekly_report.weekly_fx_performance(
+                    official_fx_history
+                )
+            except Exception as exc:
+                print(f"BOI weekly FX history unavailable; using stored rates: {exc}")
+                fx_rates = stored_fx_rates
+            else:
+                for currency in ("USD", "EUR"):
+                    if not fx_rates.get(currency, {}).get("available"):
+                        fx_rates[currency] = stored_fx_rates.get(
+                            currency, {"available": False}
+                        )
+            brief_text, report_metadata, weekly_snapshot = generate_weekly_hebrew_brief(
+                data,
+                now.date(),
+                fx_rates,
+                news_items,
+            )
+            market_close_date = (
+                weekly_snapshot.get("indices", {})
+                .get("ת״א-125", {})
+                .get("end_date")
+            )
+        else:
+            graph_scores = {
+                name: calculate_sector_graph_score(sector)
+                for name, sector in data.get("sectors", {}).items()
+            }
+            calibration = database.get_sector_score_calibration(graph_scores)
+            previous_scores = database.get_latest_sector_scores()
+            model_status = database.choose_active_recommendation_model(
+                os.getenv("RECOMMENDATION_V2_MODE", "shadow")
+            )
+            generated_scores = {}
+            recommendation_capture = {}
+            brief_text = generate_hebrew_brief(
+                data,
+                calibration=calibration,
+                previous_scores=previous_scores,
+                score_observer=generated_scores.update,
+                recommendation_observer=recommendation_capture.update,
+                model_status=model_status,
+            )
+            report_metadata = {}
+            if send:
+                tracking.update(database.record_sector_score_predictions(
+                    data, generated_scores
+                ))
+                if recommendation_capture.get("bundle"):
+                    tracking.update(database.record_v2_recommendation_bundle(
+                        data,
+                        recommendation_capture["bundle"],
+                        generated_scores,
+                        model_status["active_model"],
+                    ))
             market_close_date = (
                 data.get("indices", {})
                 .get("ת״א-125", {})
                 .get("trend", {})
                 .get("as_of")
             )
+
+        if send:
             briefing_run = database.save_briefing_run(
                 report_date,
                 market_close_date,
                 data.get("as_of"),
                 brief_text,
+                report_type=resolved_report_type,
+                metadata=report_metadata,
             )
             # In the unlikely event of a concurrent insert, the ledger's
             # immutable copy is the authoritative content to deliver.
@@ -1886,6 +2031,7 @@ def run(
     result = {
         "run_id": briefing_run["id"] if briefing_run else None,
         "report_date": report_date,
+        "report_type": resolved_report_type,
         "reused_brief": reused_brief,
         "as_of": as_of,
         "collection_stats": collection_stats,
@@ -1904,7 +2050,11 @@ def run(
     subscribers = database.get_active_subscribers()
     result["subscriber_count"] = len(subscribers)
     subject_date = datetime.strptime(report_date, "%Y-%m-%d").strftime("%d/%m/%Y")
-    subject = f"תדריך שוק ההון הישראלי – {subject_date}"
+    subject = (
+        f"סיכום שבועי — שוק ההון הישראלי – {subject_date}"
+        if resolved_report_type == "weekly"
+        else f"תדריך שוק ההון הישראלי – {subject_date}"
+    )
     for subscriber in subscribers:
         email_address = subscriber["email"]
         message_id = _daily_message_id(report_date, email_address)
@@ -1922,7 +2072,11 @@ def run(
             continue
         try:
             unsubscribe_url = f"{BASE_URL}/unsubscribe/{subscriber['token']}"
-            content = build_html_email(brief_text, unsubscribe_url)
+            content = build_html_email(
+                brief_text,
+                unsubscribe_url,
+                report_type=resolved_report_type,
+            )
             send_email(content, subject, email_address, message_id=message_id)
         except Exception as exc:
             database.mark_email_delivery_failed(
@@ -1941,12 +2095,36 @@ def run(
                 "error": f"SMTP accepted; ledger update failed: {exc}",
             })
     result["delivery"] = database.finalize_briefing_run(briefing_run["id"])
+    if resolved_report_type == "weekly" and result["delivery"]["status"] == "completed":
+        try:
+            window_start = datetime.strptime(
+                report_metadata["window_start"], "%Y-%m-%d"
+            ).date()
+            window_end = datetime.strptime(
+                report_metadata["window_end"], "%Y-%m-%d"
+            ).date()
+            result["weekly_news_cleanup"] = database.finalize_weekly_news(
+                report_date,
+                window_start,
+                window_end,
+                report_metadata.get("selected_news_ids", []),
+            )
+        except (KeyError, TypeError, ValueError):
+            result["weekly_news_cleanup"] = {
+                "skipped": True,
+                "reason": "weekly metadata unavailable",
+            }
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Israeli stock-market morning briefing")
     parser.add_argument("--dry-run", action="store_true", help="Generate but do not send email")
+    parser.add_argument(
+        "--weekly-preview",
+        action="store_true",
+        help="Generate the most recently completed weekly report (requires --dry-run)",
+    )
     parser.add_argument(
         "--force-send",
         action="store_true",
@@ -1961,6 +2139,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.force_send and (args.dry_run or args.collect_only):
         parser.error("--force-send cannot be combined with --dry-run or --collect-only")
+    if args.weekly_preview and not args.dry_run:
+        parser.error("--weekly-preview requires --dry-run")
     if args.collect_only:
         data = collect_israeli_market_data(include_news=not args.no_news)
         validate_market_data(data)
@@ -1995,7 +2175,11 @@ def main() -> None:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
     if args.dry_run:
-        result = run(send=False, include_news=not args.no_news)
+        result = run(
+            send=False,
+            include_news=not args.no_news,
+            report_type="weekly" if args.weekly_preview else None,
+        )
     else:
         with _delivery_process_lock():
             result = run(

@@ -54,10 +54,19 @@ excludes them.
 ## Morning schedule
 
 The example systemd service and timer in `deploy/` run the briefing every day at
-07:00 in the `Asia/Jerusalem` timezone. The service safely delivers each daily
-briefing at most once per recipient and exits. `Persistent=true` allows a missed
-run to execute after a VM restart without duplicating an already completed
-delivery.
+07:00 in the `Asia/Jerusalem` timezone. On Sunday the application automatically
+replaces the daily report with a summary of the preceding Monday–Saturday
+calendar window, using the actual TASE sessions within it. The service safely
+delivers each report at most once per recipient and exits. `Persistent=true`
+allows a missed run to execute after a VM restart without duplicating an already
+completed delivery.
+
+The source collector runs at 13:05 and 19:05 every day. It makes no AI call and
+does not download index charts: it only deduplicates Israeli RSS/MAYA items and
+stores official USD/ILS and EUR/ILS observations for the weekly report. The
+morning briefing performs the third daily source collection. After a weekly
+report is delivered to all active recipients, unused articles from that week are
+deleted; selected source evidence is retained for 90 days.
 
 Before deployment, replace `YOUR_GCP_USER`. The web unit binds only to the
 private Docker gateway (`172.18.0.1:5001`) and Caddy publishes the app below
@@ -66,16 +75,19 @@ private Docker gateway (`172.18.0.1:5001`) and Caddy publishes the app below
 ```bash
 sudo cp deploy/financial-brief.service /etc/systemd/system/
 sudo cp deploy/financial-brief.timer /etc/systemd/system/
+sudo cp deploy/financial-brief-sources.service /etc/systemd/system/
+sudo cp deploy/financial-brief-sources.timer /etc/systemd/system/
 sudo cp deploy/financial-brief-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now financial-brief-web.service
 sudo systemctl enable --now financial-brief.timer
+sudo systemctl enable --now financial-brief-sources.timer
 ```
 
 Check scheduling and logs:
 
 ```bash
-systemctl list-timers financial-brief.timer
+systemctl list-timers financial-brief.timer financial-brief-sources.timer
 journalctl -u financial-brief.service -n 100 --no-pager
 ```
 

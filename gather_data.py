@@ -17,7 +17,7 @@ def gather():
     database.init_db()
 
     # Intraday snapshots focus on official TASE and Bank of Israel data. News is
-    # fetched only by the morning briefing to avoid storing duplicate headlines.
+    # handled by gather_weekly_sources.py to avoid unnecessary market requests.
     # Intraday snapshots need current prices and breadth, not hundreds of
     # historical chart rows. The full morning run refreshes technicals once.
     snapshot = collect_israeli_market_data(
@@ -26,7 +26,8 @@ def gather():
     )
 
     database.save_market_snapshot(snapshot)
-    database.cleanup_old_snapshots(days=7)
+    database.record_fx_rates(snapshot)
+    database.cleanup_old_snapshots(days=10)
     print(f"✅ Snapshot saved – {now_str}")
 
 

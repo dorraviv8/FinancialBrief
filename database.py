@@ -8,10 +8,14 @@ import secrets
 import json
 import os
 import hashlib
+import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
+
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 DB_PATH = os.getenv(
     "FINANCIAL_BRIEF_DB_PATH",
@@ -36,6 +40,14 @@ def get_connection():
     conn = sqlite3.connect(DB_PATH, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ensure_column(conn, table: str, column: str, definition: str) -> None:
+    columns = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db():
@@ -250,6 +262,49 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_v2_backtest_horizon
             ON sector_v2_backtest_samples (horizon_sessions, sample_date)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_news (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint        TEXT UNIQUE NOT NULL,
+                source             TEXT NOT NULL,
+                reliability        TEXT NOT NULL,
+                title              TEXT NOT NULL,
+                summary            TEXT,
+                link               TEXT,
+                companies_json     TEXT NOT NULL DEFAULT '[]',
+                published          TEXT,
+                first_seen_at      TEXT NOT NULL,
+                last_seen_at       TEXT NOT NULL,
+                selected_for_report TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_weekly_news_published
+            ON weekly_news (published, selected_for_report)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS news_collection_state (
+                id                INTEGER PRIMARY KEY CHECK (id = 1),
+                last_collected_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fx_rate_history (
+                rate_date       TEXT NOT NULL,
+                currency        TEXT NOT NULL,
+                ils_rate        REAL NOT NULL,
+                unit            REAL,
+                official_update TEXT,
+                observed_at     TEXT NOT NULL,
+                PRIMARY KEY (rate_date, currency)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fx_rate_history_currency
+            ON fx_rate_history (currency, rate_date)
+        """)
+        _ensure_column(conn, "briefing_runs", "report_type", "TEXT NOT NULL DEFAULT 'daily'")
+        _ensure_column(conn, "briefing_runs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         conn.commit()
 
 
@@ -422,6 +477,269 @@ def cleanup_old_snapshots(days: int = 7):
         conn.commit()
 
 
+# ── Weekly source ledger ──────────────────────────────────────────────────────
+
+def _news_fingerprint(item: dict) -> str:
+    normalized_title = " ".join(
+        re.sub(r"[^0-9a-zA-Zא-ת]+", " ", str(item.get("title") or "").lower()).split()
+    )
+    identity = f"{item.get('source') or ''}\0{normalized_title}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def save_weekly_news(
+    items: list[dict],
+    collected_at: str | None = None,
+    mark_collection: bool = True,
+) -> dict:
+    """Upsert source-linked articles so Sunday can rank the full trading week."""
+    now = collected_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = []
+    for item in items:
+        title = str(item.get("title") or "").strip()
+        source = str(item.get("source") or "").strip()
+        if not title or not source:
+            continue
+        rows.append((
+            _news_fingerprint(item),
+            source,
+            str(item.get("reliability") or "financial_press"),
+            title,
+            str(item.get("summary") or "").strip()[:1200] or None,
+            item.get("link"),
+            json.dumps(item.get("companies") or [], ensure_ascii=False),
+            item.get("published"),
+            now,
+            now,
+        ))
+    with get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO weekly_news
+                (fingerprint, source, reliability, title, summary, link,
+                 companies_json, published, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+                summary = CASE
+                    WHEN excluded.summary IS NOT NULL THEN excluded.summary
+                    ELSE weekly_news.summary
+                END,
+                link = COALESCE(excluded.link, weekly_news.link),
+                companies_json = excluded.companies_json,
+                published = COALESCE(excluded.published, weekly_news.published),
+                last_seen_at = excluded.last_seen_at
+            """,
+            rows,
+        )
+        if mark_collection:
+            conn.execute(
+                """
+                INSERT INTO news_collection_state (id, last_collected_at)
+                VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET last_collected_at = excluded.last_collected_at
+                """,
+                (now,),
+            )
+        conn.commit()
+    return {"news_upserted": len(rows), "collected_at": now}
+
+
+def should_collect_weekly_news(minimum_hours: float = 4.0) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT last_collected_at FROM news_collection_state WHERE id = 1"
+        ).fetchone()
+    if not row:
+        return True
+    try:
+        last = datetime.fromisoformat(row["last_collected_at"].replace("Z", "+00:00"))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return True
+    return datetime.now(timezone.utc) - last >= timedelta(hours=minimum_hours)
+
+
+def _parse_utc_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def get_weekly_news(window_start, window_end) -> list[dict]:
+    """Return deduplicated articles published inside an inclusive local-date window."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM weekly_news ORDER BY published, first_seen_at"
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        published = _parse_utc_datetime(item.get("published"))
+        observed = _parse_utc_datetime(item.get("first_seen_at"))
+        timestamp = published or observed
+        if timestamp is None:
+            continue
+        local_date = timestamp.astimezone(ISRAEL_TZ).date()
+        if window_start <= local_date <= window_end:
+            try:
+                item["companies"] = json.loads(item.pop("companies_json") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["companies"] = []
+            items.append(item)
+    return items
+
+
+def finalize_weekly_news(
+    report_date: str,
+    window_start,
+    window_end,
+    selected_ids: list[int],
+) -> dict:
+    """Keep selected evidence and discard unused articles after successful delivery."""
+    candidates = get_weekly_news(window_start, window_end)
+    candidate_ids = {int(item["id"]) for item in candidates}
+    selected = candidate_ids.intersection(int(item_id) for item_id in selected_ids)
+    unused = candidate_ids - selected
+    with get_connection() as conn:
+        if selected:
+            placeholders = ",".join("?" for _ in selected)
+            conn.execute(
+                f"UPDATE weekly_news SET selected_for_report = ? WHERE id IN ({placeholders})",
+                (report_date, *sorted(selected)),
+            )
+        if unused:
+            placeholders = ",".join("?" for _ in unused)
+            conn.execute(
+                f"DELETE FROM weekly_news WHERE id IN ({placeholders})",
+                tuple(sorted(unused)),
+            )
+        selected_cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        orphan_cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        conn.execute(
+            "DELETE FROM weekly_news WHERE selected_for_report IS NOT NULL AND published < ?",
+            (selected_cutoff,),
+        )
+        conn.execute(
+            "DELETE FROM weekly_news WHERE selected_for_report IS NULL AND first_seen_at < ?",
+            (orphan_cutoff,),
+        )
+        conn.commit()
+    return {"selected_retained": len(selected), "unused_deleted": len(unused)}
+
+
+def _rate_date(rate: dict, observed_at: str) -> str | None:
+    for value in (rate.get("last_update"), observed_at):
+        parsed = _parse_utc_datetime(value)
+        if parsed is not None:
+            return parsed.astimezone(ISRAEL_TZ).date().isoformat()
+    return None
+
+
+def record_fx_rates(data: dict, observed_at: str | None = None) -> dict:
+    observed = observed_at or data.get("as_of") or datetime.now(timezone.utc).isoformat()
+    rows = []
+    for currency in ("USD", "EUR"):
+        rate = data.get("exchange_rates", {}).get("rates", {}).get(currency, {})
+        rate_date = _rate_date(rate, observed)
+        value = _safe_float(rate.get("ils_rate"))
+        if rate_date and value is not None and value > 0:
+            rows.append((
+                rate_date,
+                currency,
+                value,
+                _safe_float(rate.get("unit")),
+                rate.get("last_update"),
+                observed,
+            ))
+    with get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO fx_rate_history
+                (rate_date, currency, ils_rate, unit, official_update, observed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(rate_date, currency) DO UPDATE SET
+                ils_rate = excluded.ils_rate,
+                unit = excluded.unit,
+                official_update = excluded.official_update,
+                observed_at = excluded.observed_at
+            """,
+            rows,
+        )
+        conn.commit()
+    return {"fx_rates_upserted": len(rows)}
+
+
+def get_weekly_fx_rates(window_start, window_end) -> dict:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT rate_date, currency, ils_rate, unit, official_update
+            FROM fx_rate_history
+            WHERE rate_date BETWEEN ? AND ? AND currency IN ('USD', 'EUR')
+            ORDER BY currency, rate_date
+            """,
+            (window_start.isoformat(), window_end.isoformat()),
+        ).fetchall()
+        snapshots = conn.execute(
+            "SELECT snapshot_time, data_json FROM market_snapshots ORDER BY snapshot_time"
+        ).fetchall()
+    grouped_map = {"USD": {}, "EUR": {}}
+    for row in rows:
+        grouped_map[row["currency"]][row["rate_date"]] = dict(row)
+    # Compatibility backfill: deployments that predate fx_rate_history still
+    # have up to ten days of official rates inside lightweight snapshots.
+    for snapshot in snapshots:
+        try:
+            data = json.loads(snapshot["data_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for currency in ("USD", "EUR"):
+            rate = data.get("exchange_rates", {}).get("rates", {}).get(currency, {})
+            rate_date = _rate_date(rate, snapshot["snapshot_time"])
+            value = _safe_float(rate.get("ils_rate"))
+            if (
+                rate_date
+                and window_start.isoformat() <= rate_date <= window_end.isoformat()
+                and value is not None
+                and value > 0
+            ):
+                grouped_map[currency].setdefault(rate_date, {
+                    "rate_date": rate_date,
+                    "currency": currency,
+                    "ils_rate": value,
+                    "unit": _safe_float(rate.get("unit")),
+                    "official_update": rate.get("last_update"),
+                })
+    result = {}
+    for currency, point_map in grouped_map.items():
+        points = [point_map[key] for key in sorted(point_map)]
+        if not points:
+            result[currency] = {"available": False}
+            continue
+        first, last = points[0], points[-1]
+        change = (
+            ((last["ils_rate"] / first["ils_rate"]) - 1) * 100
+            if first["ils_rate"]
+            else None
+        )
+        result[currency] = {
+            "available": True,
+            "start_date": first["rate_date"],
+            "start_rate": first["ils_rate"],
+            "end_date": last["rate_date"],
+            "end_rate": last["ils_rate"],
+            "change_pct": round(change, 4) if change is not None else None,
+        }
+    return result
+
+
 # ── Sector Score Calibration ─────────────────────────────────────────────────────
 
 CALIBRATION_HORIZONS = (10, 20, 30)
@@ -553,6 +871,8 @@ def save_briefing_run(
     market_close_date: str | None,
     as_of: str | None,
     brief_text: str,
+    report_type: str = "daily",
+    metadata: dict | None = None,
 ) -> dict:
     """Persist one immutable generated briefing per Israel report date."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -562,8 +882,9 @@ def save_briefing_run(
             """
             INSERT INTO briefing_runs
                 (report_date, market_close_date, as_of, content_hash,
-                 brief_text, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'ready', ?, ?)
+                 brief_text, status, created_at, updated_at,
+                 report_type, metadata_json)
+            VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
             ON CONFLICT(report_date) DO NOTHING
             """,
             (
@@ -574,6 +895,8 @@ def save_briefing_run(
                 brief_text,
                 now,
                 now,
+                report_type,
+                json.dumps(metadata or {}, ensure_ascii=False),
             ),
         )
         conn.commit()

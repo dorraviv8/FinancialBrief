@@ -8,8 +8,12 @@ from their official public endpoints. Financial press is used only for context.
 from __future__ import annotations
 
 import math
+import html as html_lib
+import csv
+import io
 import json
 import os
+import re
 import statistics
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +34,10 @@ TASE_API_BASE = "https://api.tase.co.il/api"
 MAYA_API_BASE = "https://maya.tase.co.il/api/v1"
 BOI_RATES_URL = "https://www.boi.org.il/PublicApi/GetExchangeRates?asXml=false"
 BOI_INTEREST_URL = "https://www.boi.org.il/PublicApi/GetInterest"
+BOI_EXR_HISTORY_URL = (
+    "https://edge.boi.gov.il/FusionEdgeServer/sdmx/v2/data/dataflow/"
+    "BOI.STATISTICS/EXR/1.0/"
+)
 
 TASE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -862,6 +870,45 @@ def get_boi_exchange_rates() -> dict:
     }
 
 
+def get_boi_exchange_rate_history(start_date, end_date) -> dict:
+    """Fetch official representative USD/EUR observations for a date range."""
+    response = _session().get(
+        BOI_EXR_HISTORY_URL,
+        params={
+            "c[DATA_TYPE]": "OF00",
+            "c[BASE_CURRENCY]": "USD,EUR",
+            "c[COUNTER_CURRENCY]": "ILS",
+            "format": "csv",
+            "startPeriod": start_date.isoformat(),
+            "endPeriod": end_date.isoformat(),
+        },
+        timeout=20,
+    )
+    _increment_stat("http_requests")
+    response.raise_for_status()
+    points = {"USD": [], "EUR": []}
+    for row in csv.DictReader(io.StringIO(response.text.lstrip("\ufeff"))):
+        currency = row.get("BASE_CURRENCY")
+        if currency not in points:
+            continue
+        try:
+            value = float(row.get("OBS_VALUE"))
+            point_date = datetime.strptime(row.get("TIME_PERIOD"), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            points[currency].append({
+                "date": point_date.isoformat(),
+                "ils_rate": value,
+            })
+    for currency in points:
+        points[currency].sort(key=lambda item: item["date"])
+    return {
+        "rates": points,
+        "source": BOI_EXR_HISTORY_URL,
+    }
+
+
 def get_boi_interest_rate() -> dict:
     """Fetch the current official policy rate without scraping prose."""
     data = _request_json("GET", BOI_INTEREST_URL)
@@ -924,6 +971,11 @@ NEWS_FEEDS = [
 ]
 
 
+def _clean_feed_summary(value) -> str:
+    text = re.sub(r"<[^>]+>", " ", html_lib.unescape(str(value or "")))
+    return " ".join(text.split())[:1200]
+
+
 def get_israeli_news(hours: int = 72, per_source: int = 3, limit: int = 18) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     headlines = []
@@ -948,6 +1000,9 @@ def get_israeli_news(hours: int = 72, per_source: int = 3, limit: int = 18) -> l
                     "source": source,
                     "reliability": reliability,
                     "title": title,
+                    "summary": _clean_feed_summary(
+                        entry.get("summary") or entry.get("description")
+                    ),
                     "published": published.isoformat(),
                     "link": entry.get("link"),
                 })
@@ -963,6 +1018,9 @@ def get_israeli_news(hours: int = 72, per_source: int = 3, limit: int = 18) -> l
 def collect_israeli_market_data(
     include_news: bool = True,
     include_technicals: bool = True,
+    news_hours: int = 72,
+    news_per_source: int = 3,
+    news_limit: int = 18,
 ) -> dict:
     _reset_collection_stats()
     now = datetime.now(ISRAEL_TZ)
@@ -978,7 +1036,14 @@ def collect_israeli_market_data(
         "exchange_rates": get_boi_exchange_rates(),
         "boi_interest": get_boi_interest_rate(),
         "maya_announcements": get_maya_announcements(),
-        "news": get_israeli_news() if include_news else [],
+        "news": (
+            get_israeli_news(
+                hours=news_hours,
+                per_source=news_per_source,
+                limit=news_limit,
+            )
+            if include_news else []
+        ),
         "collection_stats": get_collection_stats(),
         "methodology": {
             "profile": "balanced",

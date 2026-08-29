@@ -211,6 +211,70 @@ class SubscriberBackupTests(unittest.TestCase):
         self.assertEqual(latest["בנקים"]["trade_date"], "2026-08-26")
         self.assertEqual(latest["בנקים"]["final_score"], 68)
 
+    def test_weekly_news_ledger_deduplicates_and_deletes_only_unused(self):
+        items = [
+            {
+                "source": "בנק ישראל",
+                "reliability": "official",
+                "title": "החלטת ריבית שבועית",
+                "published": "2026-08-25T08:00:00+03:00",
+                "link": "https://example.com/one",
+            },
+            {
+                "source": "גלובס",
+                "reliability": "financial_press",
+                "title": "הבורסה סיכמה שבוע מקוצר",
+                "published": "2026-08-28T12:00:00+03:00",
+                "link": "https://example.com/two",
+            },
+        ]
+        database.save_weekly_news(items)
+        database.save_weekly_news(items)
+        stored = database.get_weekly_news(
+            date(2026, 8, 24), date(2026, 8, 29)
+        )
+
+        self.assertEqual(len(stored), 2)
+        cleanup = database.finalize_weekly_news(
+            "2026-08-30",
+            date(2026, 8, 24),
+            date(2026, 8, 29),
+            [stored[0]["id"]],
+        )
+
+        self.assertEqual(cleanup["selected_retained"], 1)
+        self.assertEqual(cleanup["unused_deleted"], 1)
+        with database.get_connection() as conn:
+            remaining = conn.execute(
+                "SELECT selected_for_report FROM weekly_news"
+            ).fetchall()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["selected_for_report"], "2026-08-30")
+
+    def test_weekly_fx_uses_first_and_last_official_observation(self):
+        for observed, usd, eur in (
+            ("2026-08-24T10:00:00+03:00", 3.50, 4.00),
+            ("2026-08-28T10:00:00+03:00", 3.57, 3.96),
+        ):
+            database.record_fx_rates({
+                "as_of": observed,
+                "exchange_rates": {
+                    "rates": {
+                        "USD": {"ils_rate": usd, "unit": 1, "last_update": observed},
+                        "EUR": {"ils_rate": eur, "unit": 1, "last_update": observed},
+                    }
+                },
+            })
+
+        result = database.get_weekly_fx_rates(
+            date(2026, 8, 24), date(2026, 8, 29)
+        )
+
+        self.assertEqual(result["USD"]["start_rate"], 3.50)
+        self.assertEqual(result["USD"]["end_rate"], 3.57)
+        self.assertEqual(result["USD"]["change_pct"], 2.0)
+        self.assertEqual(result["EUR"]["change_pct"], -1.0)
+
     def test_delivery_claim_is_idempotent_forceable_and_retryable(self):
         briefing_run = database.save_briefing_run(
             "2026-08-28",

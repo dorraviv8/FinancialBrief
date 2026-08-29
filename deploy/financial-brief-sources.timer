@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect weekly-report sources twice between morning briefings
+
+[Timer]
+OnCalendar=*-*-* 13:05:00 Asia/Jerusalem
+OnCalendar=*-*-* 19:05:00 Asia/Jerusalem
+Persistent=true
+RandomizedDelaySec=60
+Unit=financial-brief-sources.service
+
+[Install]
+WantedBy=timers.target

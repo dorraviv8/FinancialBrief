@@ -1,15 +1,16 @@
 [Unit]
-Description=Israeli stock-market morning briefing
+Description=Prepare and QA Israeli stock-market morning briefing
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=14min
 User=YOUR_GCP_USER
 WorkingDirectory=/opt/financialbrief
 EnvironmentFile=/etc/financialbrief.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/financialbrief/fin_env/bin/python /opt/financialbrief/financial_brief.py
+ExecStart=/opt/financialbrief/fin_env/bin/python /opt/financialbrief/financial_brief.py --prepare
 
 # Basic service hardening while retaining network and database access.
 NoNewPrivileges=true

@@ -1,0 +1,11 @@
+[Unit]
+Description=Send QA-approved Israeli market briefing at 08:00
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Asia/Jerusalem
+AccuracySec=1s
+Persistent=true
+Unit=financial-brief-send.service
+
+[Install]
+WantedBy=timers.target

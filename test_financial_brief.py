@@ -680,6 +680,14 @@ class IsraelMarketTests(unittest.TestCase):
                     ) as generate,
                     patch.object(
                         financial_brief,
+                        "review_and_correct_brief",
+                        return_value=(
+                            "### בדיקה\nתוכן קבוע",
+                            {"status": "approved", "corrections_applied": 0},
+                        ),
+                    ),
+                    patch.object(
+                        financial_brief,
                         "send_email",
                         side_effect=(RuntimeError("temporary SMTP failure"), None),
                     ) as send,
@@ -718,6 +726,124 @@ class IsraelMarketTests(unittest.TestCase):
                 self.assertEqual(delivery["attempts"], 2)
             finally:
                 financial_brief.database.DB_PATH = original_db_path
+
+    def test_prepare_then_send_uses_only_the_qa_approved_stored_report(self):
+        fixed_now = datetime(
+            2026, 8, 31, 7, 45, tzinfo=financial_brief.ISRAEL_TZ
+        )
+        data = {
+            "as_of": "2026-08-31T07:45:00+03:00",
+            "indices": {"ת״א-125": {"trend": {"as_of": "2026-08-28"}}},
+            "sectors": {},
+            "collection_stats": {"http_requests": 1},
+        }
+        brief = "### דוח מאושר\nתוכן שנבדק ונשמר לפני שליחתו לקוראים."
+        qa = {
+            "status": "approved",
+            "review_result": "pass",
+            "corrections_applied": 0,
+        }
+
+        with TemporaryDirectory() as directory:
+            original_db_path = financial_brief.database.DB_PATH
+            financial_brief.database.DB_PATH = str(Path(directory) / "brief.db")
+            try:
+                financial_brief.database.init_db()
+                financial_brief.database.add_subscriber(
+                    "Reader", "reader@example.com"
+                )
+                with (
+                    patch.object(financial_brief, "OWNER_EMAIL", None),
+                    patch.object(financial_brief, "GMAIL_USER", "sender@example.com"),
+                    patch.object(financial_brief, "GMAIL_APP_PASSWORD", "secret"),
+                    patch.object(financial_brief, "_today", return_value=fixed_now),
+                    patch.object(
+                        financial_brief,
+                        "collect_israeli_market_data",
+                        return_value=data,
+                    ) as collect,
+                    patch.object(financial_brief, "validate_market_data"),
+                    patch.object(
+                        financial_brief,
+                        "generate_hebrew_brief",
+                        return_value=brief,
+                    ) as generate,
+                    patch.object(
+                        financial_brief,
+                        "review_and_correct_brief",
+                        return_value=(brief, qa),
+                    ) as review,
+                    patch.object(financial_brief, "send_email") as send,
+                ):
+                    prepared = financial_brief.run(
+                        send=False, persist_report=True
+                    )
+                    delivered = financial_brief.run(
+                        send=True, approved_only=True
+                    )
+
+                self.assertEqual(prepared["sent"], 0)
+                self.assertEqual(delivered["sent"], 1)
+                self.assertTrue(delivered["reused_brief"])
+                collect.assert_called_once_with(include_news=True)
+                generate.assert_called_once()
+                review.assert_called_once()
+                send.assert_called_once()
+                with financial_brief.database.get_connection() as conn:
+                    row = conn.execute(
+                        "SELECT qa_status, prepared_at, metadata_json FROM briefing_runs"
+                    ).fetchone()
+                self.assertEqual(row["qa_status"], "approved")
+                self.assertIsNotNone(row["prepared_at"])
+                self.assertIn('"status": "approved"', row["metadata_json"])
+            finally:
+                financial_brief.database.DB_PATH = original_db_path
+
+    def test_approved_only_refuses_legacy_unreviewed_report(self):
+        fixed_now = datetime(
+            2026, 8, 31, 8, 0, tzinfo=financial_brief.ISRAEL_TZ
+        )
+        with TemporaryDirectory() as directory:
+            original_db_path = financial_brief.database.DB_PATH
+            financial_brief.database.DB_PATH = str(Path(directory) / "brief.db")
+            try:
+                financial_brief.database.init_db()
+                financial_brief.database.save_briefing_run(
+                    "2026-08-31", "2026-08-28", fixed_now.isoformat(), "legacy"
+                )
+                with (
+                    patch.object(financial_brief, "OWNER_EMAIL", None),
+                    patch.object(financial_brief, "GMAIL_USER", "sender@example.com"),
+                    patch.object(financial_brief, "GMAIL_APP_PASSWORD", "secret"),
+                    patch.object(financial_brief, "_today", return_value=fixed_now),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "not QA-approved"):
+                        financial_brief.run(send=True, approved_only=True)
+            finally:
+                financial_brief.database.DB_PATH = original_db_path
+
+    def test_quality_corrections_cannot_change_report_numbers(self):
+        brief = "המדד עלה ב-2.50% השבוע. המשפט הזה אינו ברור."
+        corrected, applied = financial_brief._apply_quality_replacements(
+            brief,
+            [
+                {
+                    "old": "המדד עלה ב-2.50% השבוע.",
+                    "new": "המדד עלה ב-3.50% השבוע.",
+                    "reason": "unsafe numeric change",
+                },
+                {
+                    "old": "המשפט הזה אינו ברור.",
+                    "new": "המשפט נוסח מחדש בצורה ברורה.",
+                    "reason": "clarity",
+                },
+            ],
+        )
+
+        self.assertIn("2.50%", corrected)
+        self.assertNotIn("3.50%", corrected)
+        self.assertIn("נוסח מחדש", corrected)
+        self.assertEqual(len(applied), 1)
 
     def test_process_lock_rejects_overlapping_delivery(self):
         with TemporaryDirectory() as directory, patch.dict(

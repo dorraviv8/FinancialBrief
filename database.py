@@ -305,6 +305,8 @@ def init_db():
         """)
         _ensure_column(conn, "briefing_runs", "report_type", "TEXT NOT NULL DEFAULT 'daily'")
         _ensure_column(conn, "briefing_runs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(conn, "briefing_runs", "qa_status", "TEXT NOT NULL DEFAULT 'legacy'")
+        _ensure_column(conn, "briefing_runs", "prepared_at", "TEXT")
         conn.commit()
 
 
@@ -873,6 +875,7 @@ def save_briefing_run(
     brief_text: str,
     report_type: str = "daily",
     metadata: dict | None = None,
+    qa_status: str = "legacy",
 ) -> dict:
     """Persist one immutable generated briefing per Israel report date."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -883,8 +886,8 @@ def save_briefing_run(
             INSERT INTO briefing_runs
                 (report_date, market_close_date, as_of, content_hash,
                  brief_text, status, created_at, updated_at,
-                 report_type, metadata_json)
-            VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+                 report_type, metadata_json, qa_status, prepared_at)
+            VALUES (?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?)
             ON CONFLICT(report_date) DO NOTHING
             """,
             (
@@ -897,6 +900,8 @@ def save_briefing_run(
                 now,
                 report_type,
                 json.dumps(metadata or {}, ensure_ascii=False),
+                qa_status,
+                now,
             ),
         )
         conn.commit()

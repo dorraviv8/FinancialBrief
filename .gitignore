@@ -20,6 +20,7 @@ subscribers.db
 # ── Logs ──
 *.log
 logs/
+financial-brief.lock
 
 # ── Regenerable market history cache ──
 market-cache/

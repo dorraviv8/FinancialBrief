@@ -53,18 +53,23 @@ excludes them.
 
 ## Morning schedule
 
-The example systemd service and timer in `deploy/` run the briefing every day at
-07:00 in the `Asia/Jerusalem` timezone. On Sunday the application automatically
-replaces the daily report with a summary of the preceding Monday–Saturday
-calendar window, using the actual TASE sessions within it. The service safely
-delivers each report at most once per recipient and exits. `Persistent=true`
-allows a missed run to execute after a VM restart without duplicating an already
-completed delivery.
+The morning workflow is deliberately split into two services. At 07:45 in the
+`Asia/Jerusalem` timezone, the preparation service gathers fresh data, generates
+the report, reads the completed output through deterministic and AI clarity/fact
+checks, applies only guarded prose corrections, and stores it with
+`qa_status=approved`. At 08:00, the delivery service sends only today's stored,
+approved report. It refuses to generate a replacement or send an unapproved
+report. On Sunday the preparation stage automatically creates the weekly summary
+for the preceding Monday–Saturday calendar window, using actual TASE sessions.
+
+Both timers use `Persistent=true`. If a restart causes both missed jobs to run,
+the send service is ordered after preparation and still enforces the approval
+check. The delivery ledger safely sends each report at most once per recipient.
 
 The source collector runs at 13:05 and 19:05 every day. It makes no AI call and
 does not download index charts: it only deduplicates Israeli RSS/MAYA items and
 stores official USD/ILS and EUR/ILS observations for the weekly report. The
-morning briefing performs the third daily source collection. After a weekly
+07:45 preparation performs the third daily source collection. After a weekly
 report is delivered to all active recipients, unused articles from that week are
 deleted; selected source evidence is retained for 90 days.
 
@@ -75,19 +80,22 @@ private Docker gateway (`172.18.0.1:5001`) and Caddy publishes the app below
 ```bash
 sudo cp deploy/financial-brief.service /etc/systemd/system/
 sudo cp deploy/financial-brief.timer /etc/systemd/system/
+sudo cp deploy/financial-brief-send.service /etc/systemd/system/
+sudo cp deploy/financial-brief-send.timer /etc/systemd/system/
 sudo cp deploy/financial-brief-sources.service /etc/systemd/system/
 sudo cp deploy/financial-brief-sources.timer /etc/systemd/system/
 sudo cp deploy/financial-brief-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now financial-brief-web.service
 sudo systemctl enable --now financial-brief.timer
+sudo systemctl enable --now financial-brief-send.timer
 sudo systemctl enable --now financial-brief-sources.timer
 ```
 
 Check scheduling and logs:
 
 ```bash
-systemctl list-timers financial-brief.timer financial-brief-sources.timer
+systemctl list-timers financial-brief.timer financial-brief-send.timer financial-brief-sources.timer
 journalctl -u financial-brief.service -n 100 --no-pager
 ```
 

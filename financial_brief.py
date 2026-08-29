@@ -1668,6 +1668,184 @@ def generate_weekly_hebrew_brief(
     return brief, metadata, snapshot
 
 
+def _quality_fact_tokens(value: str) -> list[str]:
+    return re.findall(r"[+-]?\d[\d,.]*(?:%|/100)?", value or "")
+
+
+def _deterministic_quality_issues(
+    brief_text: str,
+    report_type: str,
+    context: dict,
+) -> list[str]:
+    issues = []
+    if len(re.findall(r"[א-ת]", brief_text or "")) < 120:
+        issues.append("report does not contain enough Hebrew content")
+    for residue in ("CATALYST|", "SCORE|", "OUTLOOK|", "QA|", "```"):
+        if residue in brief_text:
+            issues.append(f"machine or invalid residue remains: {residue}")
+    for invalid_value in ("None", "nan"):
+        if re.search(rf"(?<![A-Za-z]){invalid_value}(?![A-Za-z])", brief_text):
+            issues.append(f"standalone invalid value remains: {invalid_value}")
+    if "פרופיל משקיע" in brief_text:
+        issues.append("removed investor-profile section returned")
+
+    if report_type == "weekly":
+        required = (
+            "### החדשות המרכזיות של השבוע",
+            "### מדד ת״א-35 — ביצוע שבועי",
+            "### מדד ת״א-90 — ביצוע שבועי",
+            "### מדד ת״א-125 — ביצוע שבועי",
+            "### מטבע חוץ — שינוי שבועי",
+            "### סקירת הסקטורים",
+            "### מבט לשבוע הבא",
+        )
+        if "אין עדיין מספיק תצפיות שבועיות" in brief_text:
+            issues.append("weekly FX calculation is incomplete")
+        snapshot = context.get("weekly_snapshot", {})
+        for key in ("window_start", "window_end"):
+            value = snapshot.get(key)
+            if value:
+                formatted = _format_market_date(value).replace(".", "/")
+                if formatted not in brief_text:
+                    issues.append(f"weekly window date is missing: {value}")
+    else:
+        required = (
+            "### תמונת מצב בבורסה בתל אביב",
+            "### מבט להמשך",
+            "### מדדי תל אביב – תמונת סגירה",
+            "### דירוג כל הסקטורים",
+            "### חדשות, מאקרו ומקורות",
+        )
+    for title in required:
+        if title not in brief_text:
+            issues.append(f"required section missing: {title}")
+    if report_type == "weekly" and brief_text.count("### סקירת הסקטורים") != 1:
+        issues.append("weekly sectors must appear in exactly one card")
+    if brief_text.count("https://") < 3:
+        issues.append("source links are incomplete")
+    return issues
+
+
+def _parse_quality_response(value: str) -> dict | None:
+    start = (value or "").find("{")
+    end = (value or "").rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(value[start:end + 1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("status") not in {"pass", "revise"}:
+        return None
+    if not isinstance(parsed.get("replacements", []), list):
+        return None
+    return parsed
+
+
+def _apply_quality_replacements(
+    brief_text: str,
+    replacements: list[dict],
+) -> tuple[str, list[dict]]:
+    corrected = brief_text
+    applied = []
+    for replacement in replacements[:5]:
+        old = str(replacement.get("old") or "").strip()
+        new = str(replacement.get("new") or "").strip()
+        if not old or not new or old == new or corrected.count(old) != 1:
+            continue
+        if "\n" in old or "\n" in new or "###" in new or "|" in new:
+            continue
+        if _quality_fact_tokens(old) != _quality_fact_tokens(new):
+            continue
+        if re.findall(r"https?://[^\s)]+", old) != re.findall(r"https?://[^\s)]+", new):
+            continue
+        if len(new) > max(500, len(old) * 2):
+            continue
+        corrected = corrected.replace(old, new, 1)
+        applied.append({
+            "old": old,
+            "new": new,
+            "reason": str(replacement.get("reason") or "")[:240],
+        })
+    return corrected, applied
+
+
+def review_and_correct_brief(
+    brief_text: str,
+    report_type: str,
+    fact_context: dict,
+) -> tuple[str, dict]:
+    """Read the completed report, apply safe prose corrections, and approve it."""
+    structural_issues = _deterministic_quality_issues(
+        brief_text, report_type, fact_context
+    )
+    if structural_issues:
+        raise RuntimeError("Report quality gate failed: " + "; ".join(structural_issues))
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is required for report quality review")
+
+    prompt = f"""אתה עורך בקרה אחרון לדוח שוק ההון הישראלי. קרא את הדוח המלא ובדוק עברית, בהירות לקורא ללא ידע טכני, סתירות פנימיות וטענות שאינן נתמכות בהקשר העובדתי. המספרים, התאריכים, הטבלאות והקישורים חושבו מקומית: אין לשנות אותם. אין להוסיף מידע חיצוני, תחזית חדשה או המלצת קנייה.
+
+אם הדוח ברור ונתמך, החזר JSON בלבד:
+{{"status":"pass","summary":"הסבר קצר","replacements":[]}}
+
+אם נדרש תיקון, החזר עד שלושה תיקוני משפטים מדויקים:
+{{"status":"revise","summary":"הסבר קצר","replacements":[{{"old":"משפט מדויק שמופיע פעם אחת בדוח","new":"ניסוח עברי מתוקן עם אותם מספרים","reason":"סיבה"}}]}}
+
+אסור לשנות כותרות Markdown, קישורים, מספרים או תאריכים. כל old ו-new חייבים להיות משפט יחיד ללא ירידת שורה.
+
+סוג הדוח: {report_type}
+הקשר עובדתי מאומת: {json.dumps(fact_context, ensure_ascii=False, separators=(",", ":"))}
+
+הדוח המלא:
+{brief_text}"""
+    client = Groq(
+        api_key=GROQ_API_KEY,
+        timeout=GROQ_TIMEOUT_SECONDS,
+        max_retries=1,
+    )
+    review = None
+    for attempt in range(2):
+        raw = _groq_completion(
+            client,
+            GROQ_MODEL,
+            prompt,
+            max_tokens=500,
+            purpose="quality-review" if attempt == 0 else "quality-review-retry",
+        )
+        review = _parse_quality_response(raw)
+        if review is not None:
+            break
+        prompt += "\n\nהתשובה הקודמת לא הייתה JSON תקין. החזר כעת רק את אובייקט ה-JSON."
+    if review is None:
+        raise RuntimeError("Report quality reviewer returned invalid output twice")
+
+    corrected = brief_text
+    applied = []
+    if review["status"] == "revise":
+        corrected, applied = _apply_quality_replacements(
+            brief_text, review.get("replacements", [])
+        )
+        if not applied:
+            raise RuntimeError(
+                "Report quality reviewer requested changes but supplied no safe correction"
+            )
+    post_issues = _deterministic_quality_issues(
+        corrected, report_type, fact_context
+    )
+    if post_issues:
+        raise RuntimeError("Corrected report failed quality gate: " + "; ".join(post_issues))
+    return corrected, {
+        "status": "approved",
+        "review_result": review["status"],
+        "summary": str(review.get("summary") or "")[:400],
+        "corrections_applied": len(applied),
+        "corrections": applied,
+        "reviewed_at": _today().isoformat(timespec="seconds"),
+        "model": GROQ_MODEL,
+    }
+
+
 def _render_inline_markdown(text: str) -> str:
     escaped = html.escape(text, quote=False)
     escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
@@ -1871,9 +2049,15 @@ def run(
     include_news: bool = True,
     force_send: bool = False,
     report_type: str | None = None,
+    persist_report: bool = False,
+    approved_only: bool = False,
 ) -> dict:
     if force_send and not send:
         raise ValueError("force_send requires email delivery")
+    if approved_only and not send:
+        raise ValueError("approved_only requires email delivery")
+
+    persist_report = bool(persist_report or send)
 
     database.init_db()
     if OWNER_EMAIL:
@@ -1890,7 +2074,19 @@ def run(
     if resolved_report_type not in {"daily", "weekly"}:
         raise ValueError("report_type must be 'daily' or 'weekly'")
     report_date = now.date().isoformat()
-    existing_run = database.get_briefing_run(report_date) if send else None
+    existing_run = database.get_briefing_run(report_date) if persist_report else None
+    if approved_only and existing_run is None:
+        raise RuntimeError(
+            f"No prepared and approved report exists for {report_date}"
+        )
+    if approved_only and existing_run.get("qa_status") != "approved":
+        raise RuntimeError(
+            f"Prepared report for {report_date} is not QA-approved"
+        )
+    if existing_run and not send and existing_run.get("qa_status") != "approved":
+        raise RuntimeError(
+            f"Existing report for {report_date} predates the approval workflow"
+        )
     reused_brief = existing_run is not None
     tracking = {
         "close_rows_upserted": 0,
@@ -1921,7 +2117,7 @@ def run(
             })
         data = collect_israeli_market_data(**collection_options)
         validate_market_data(data)
-        if send:
+        if persist_report:
             tracking.update(database.record_market_close_history(data))
             tracking.update(database.settle_sector_score_outcomes())
             tracking.update(database.settle_v2_prediction_outcomes())
@@ -1940,7 +2136,7 @@ def run(
                 preliminary["window_end"], "%Y-%m-%d"
             ).date()
             news_items = database.get_weekly_news(window_start, window_end)
-            if not send:
+            if not persist_report:
                 news_items = _temporary_weekly_news(
                     data, news_items, window_start, window_end
                 )
@@ -1972,6 +2168,18 @@ def run(
                 .get("ת״א-125", {})
                 .get("end_date")
             )
+            quality_context = {
+                "weekly_snapshot": weekly_snapshot,
+                "fx_rates": fx_rates,
+                "news": [
+                    {
+                        "source": item.get("source"),
+                        "title": item.get("title"),
+                        "published": item.get("published"),
+                    }
+                    for item in news_items[:24]
+                ],
+            }
         else:
             graph_scores = {
                 name: calculate_sector_graph_score(sector)
@@ -1993,7 +2201,33 @@ def run(
                 model_status=model_status,
             )
             report_metadata = {}
-            if send:
+            market_close_date = (
+                data.get("indices", {})
+                .get("ת״א-125", {})
+                .get("trend", {})
+                .get("as_of")
+            )
+            quality_context = {
+                "market": _compact_market_payload(data),
+                "sector_scores": {
+                    name: {
+                        "score": score.get("final_score"),
+                        "graph": score.get("graph_score"),
+                        "news_adjustment": score.get("news_adjustment"),
+                    }
+                    for name, score in generated_scores.items()
+                },
+                "source_headlines": _compact_sector_news(data),
+            }
+
+        if persist_report:
+            brief_text, qa_result = review_and_correct_brief(
+                brief_text,
+                resolved_report_type,
+                quality_context,
+            )
+            report_metadata["qa"] = qa_result
+            if resolved_report_type == "daily":
                 tracking.update(database.record_sector_score_predictions(
                     data, generated_scores
                 ))
@@ -2004,14 +2238,6 @@ def run(
                         generated_scores,
                         model_status["active_model"],
                     ))
-            market_close_date = (
-                data.get("indices", {})
-                .get("ת״א-125", {})
-                .get("trend", {})
-                .get("as_of")
-            )
-
-        if send:
             briefing_run = database.save_briefing_run(
                 report_date,
                 market_close_date,
@@ -2019,6 +2245,7 @@ def run(
                 brief_text,
                 report_type=resolved_report_type,
                 metadata=report_metadata,
+                qa_status="approved",
             )
             # In the unlikely event of a concurrent insert, the ledger's
             # immutable copy is the authoritative content to deliver.
@@ -2032,6 +2259,8 @@ def run(
         "run_id": briefing_run["id"] if briefing_run else None,
         "report_date": report_date,
         "report_type": resolved_report_type,
+        "qa_status": briefing_run.get("qa_status") if briefing_run else None,
+        "prepared_at": briefing_run.get("prepared_at") if briefing_run else None,
         "reused_brief": reused_brief,
         "as_of": as_of,
         "collection_stats": collection_stats,
@@ -2135,10 +2364,32 @@ def main() -> None:
         action="store_true",
         help="Validate sources without AI generation, database writes, or email",
     )
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Gather, generate, QA-approve, and persist today's report without sending",
+    )
+    parser.add_argument(
+        "--send-prepared",
+        action="store_true",
+        help="Send only today's already prepared and QA-approved report",
+    )
     parser.add_argument("--no-news", action="store_true", help="Skip press feeds during diagnostics")
     args = parser.parse_args()
-    if args.force_send and (args.dry_run or args.collect_only):
-        parser.error("--force-send cannot be combined with --dry-run or --collect-only")
+    selected_modes = sum(bool(value) for value in (
+        args.dry_run,
+        args.collect_only,
+        args.prepare,
+        args.send_prepared,
+    ))
+    if selected_modes > 1:
+        parser.error(
+            "--dry-run, --collect-only, --prepare and --send-prepared are mutually exclusive"
+        )
+    if args.force_send and (args.dry_run or args.collect_only or args.prepare):
+        parser.error(
+            "--force-send cannot be combined with --dry-run, --collect-only or --prepare"
+        )
     if args.weekly_preview and not args.dry_run:
         parser.error("--weekly-preview requires --dry-run")
     if args.collect_only:
@@ -2180,6 +2431,20 @@ def main() -> None:
             include_news=not args.no_news,
             report_type="weekly" if args.weekly_preview else None,
         )
+    elif args.prepare:
+        with _delivery_process_lock():
+            result = run(
+                send=False,
+                include_news=not args.no_news,
+                persist_report=True,
+            )
+    elif args.send_prepared:
+        with _delivery_process_lock():
+            result = run(
+                send=True,
+                approved_only=True,
+                force_send=args.force_send,
+            )
     else:
         with _delivery_process_lock():
             result = run(

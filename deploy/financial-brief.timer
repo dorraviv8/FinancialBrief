@@ -1,10 +1,10 @@
 [Unit]
-Description=Run Israeli market briefing every morning
+Description=Prepare Israeli market briefing at 07:45
 
 [Timer]
-OnCalendar=*-*-* 07:00:00 Asia/Jerusalem
+OnCalendar=*-*-* 07:45:00 Asia/Jerusalem
+AccuracySec=1s
 Persistent=true
-RandomizedDelaySec=30
 Unit=financial-brief.service
 
 [Install]

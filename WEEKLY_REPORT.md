@@ -1,7 +1,8 @@
 # Weekend Report – Weekly Summary
 
-Every Sunday, the normal 07:00 delivery path automatically generates a weekly
-Israeli-market report instead of the daily report. Weekday behavior is unchanged.
+Every Sunday, the 07:45 preparation path automatically generates and QA-approves
+a weekly Israeli-market report instead of the daily report. The approved report
+is sent at 08:00. Weekday behavior is unchanged.
 
 ## Calculation rules
 
@@ -18,7 +19,7 @@ Israeli-market report instead of the daily report. Weekday behavior is unchanged
 
 ## News lifecycle and AI limits
 
-- The 07:00 report and the source-only 13:05/19:05 timer collect Israeli RSS,
+- The 07:45 preparation and the source-only 13:05/19:05 timer collect Israeli RSS,
   MAYA disclosures and Bank of Israel rates. The source-only job downloads no
   TASE charts and makes no AI request.
 - Articles are deduplicated by source and normalized title. Up to 60 weekly

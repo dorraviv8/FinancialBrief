@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, timedelta
 from unittest.mock import patch
 
 import database
@@ -277,6 +278,76 @@ class SubscriberBackupTests(unittest.TestCase):
         self.assertEqual(
             second["reason"], "delivery_in_progress_or_ambiguous"
         )
+
+    def test_v2_feature_ledger_predictions_and_live_settlement(self):
+        horizons = {}
+        for horizon in (10, 20, 30):
+            horizons[horizon] = {
+                "final_score": 68,
+                "probability_positive_pct": 62,
+                "probability_outperform_pct": 60,
+                "risk_quality": 65,
+                "confidence_pct": 58,
+                "expected_excess_return_pct": 1.2,
+                "expected_excess_low_pct": -0.5,
+                "expected_excess_high_pct": 2.4,
+                "news_catalyst_adjustment": 1,
+            }
+        bundle = {
+            "model_version": "test-v2",
+            "feature_version": "test-features",
+            "historical_samples": [],
+            "evaluation": {horizon: {"sample_count": 50} for horizon in (10, 20, 30)},
+            "sectors": {
+                "בנקים": {
+                    "features": {
+                        "data_date": "2026-01-01",
+                        "relative_return_20d_pct": 2.0,
+                    },
+                    "catalyst": {"adjustment": 1},
+                    "horizons": horizons,
+                }
+            },
+        }
+        data = {
+            "indices": {"ת״א-125": {"trend": {"last_close": 100}}},
+            "sectors": {
+                "בנקים": {"trend": {"last_close": 100, "as_of": "2026-01-01"}}
+            },
+        }
+        result = database.record_v2_recommendation_bundle(
+            data,
+            bundle,
+            {"בנקים": {"legacy_final_score": 65}},
+            "v1",
+        )
+        start = date(2026, 1, 1)
+        with database.get_connection() as conn:
+            for offset in range(1, 31):
+                trade_date = (start + timedelta(days=offset)).isoformat()
+                conn.execute(
+                    "INSERT INTO market_close_history VALUES (?, ?, ?)",
+                    (trade_date, "בנקים", 100 + offset),
+                )
+                conn.execute(
+                    "INSERT INTO market_close_history VALUES (?, 'ת״א-125', ?)",
+                    (trade_date, 100 + (offset / 2)),
+                )
+            conn.commit()
+
+        settled = database.settle_v2_prediction_outcomes()
+        comparison = database.get_v2_live_comparison()
+
+        self.assertEqual(result["v2_features_upserted"], 1)
+        self.assertEqual(result["v2_predictions_upserted"], 3)
+        self.assertEqual(settled["v2_outcomes_settled"], 3)
+        self.assertEqual(comparison["sample_size"], 1)
+        self.assertFalse(comparison["eligible_for_promotion"])
+        with database.get_connection() as conn:
+            outcomes = conn.execute(
+                "SELECT COUNT(*) FROM sector_v2_outcomes"
+            ).fetchone()[0]
+        self.assertEqual(outcomes, 3)
 
 
 if __name__ == "__main__":

@@ -156,6 +156,100 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_email_deliveries_status
             ON email_deliveries (run_id, status)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sector_v2_feature_snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date      TEXT NOT NULL,
+                sector_name     TEXT NOT NULL,
+                feature_version TEXT NOT NULL,
+                features_json   TEXT NOT NULL,
+                sector_close    REAL NOT NULL,
+                benchmark_close REAL NOT NULL,
+                created_at      TEXT NOT NULL,
+                UNIQUE (trade_date, sector_name, feature_version)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sector_v2_backtest_samples (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                sample_date          TEXT NOT NULL,
+                sector_name          TEXT NOT NULL,
+                horizon_sessions     INTEGER NOT NULL,
+                feature_version      TEXT NOT NULL,
+                features_json        TEXT NOT NULL,
+                outcome_date         TEXT NOT NULL,
+                sector_return_pct    REAL NOT NULL,
+                benchmark_return_pct REAL NOT NULL,
+                excess_return_pct    REAL NOT NULL,
+                positive             INTEGER NOT NULL,
+                outperformed         INTEGER NOT NULL,
+                max_drawdown_pct     REAL NOT NULL,
+                created_at           TEXT NOT NULL,
+                UNIQUE (
+                    sample_date, sector_name, horizon_sessions, feature_version
+                )
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sector_v2_predictions (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date                  TEXT NOT NULL,
+                sector_name                 TEXT NOT NULL,
+                horizon_sessions            INTEGER NOT NULL,
+                model_version               TEXT NOT NULL,
+                feature_version             TEXT NOT NULL,
+                score                       INTEGER NOT NULL,
+                legacy_score                INTEGER NOT NULL,
+                probability_positive_pct    REAL NOT NULL,
+                probability_outperform_pct  REAL NOT NULL,
+                risk_quality                INTEGER NOT NULL,
+                confidence_pct              INTEGER NOT NULL,
+                expected_excess_return_pct  REAL NOT NULL,
+                expected_excess_low_pct     REAL,
+                expected_excess_high_pct    REAL,
+                news_adjustment              INTEGER NOT NULL,
+                active_model                 TEXT NOT NULL,
+                features_json                TEXT NOT NULL,
+                catalyst_json                TEXT NOT NULL,
+                sector_close                 REAL NOT NULL,
+                benchmark_close              REAL NOT NULL,
+                created_at                   TEXT NOT NULL,
+                UNIQUE (
+                    trade_date, sector_name, horizon_sessions, model_version
+                )
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sector_v2_outcomes (
+                prediction_id        INTEGER PRIMARY KEY,
+                outcome_date         TEXT NOT NULL,
+                sector_return_pct    REAL NOT NULL,
+                benchmark_return_pct REAL NOT NULL,
+                excess_return_pct    REAL NOT NULL,
+                positive             INTEGER NOT NULL,
+                outperformed         INTEGER NOT NULL,
+                max_drawdown_pct     REAL NOT NULL,
+                FOREIGN KEY (prediction_id) REFERENCES sector_v2_predictions(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recommendation_model_evaluations (
+                evaluation_date TEXT NOT NULL,
+                model_version   TEXT NOT NULL,
+                horizon_sessions INTEGER NOT NULL,
+                metrics_json    TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                PRIMARY KEY (evaluation_date, model_version, horizon_sessions)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_v2_predictions_outcome
+            ON sector_v2_predictions (horizon_sessions, trade_date, sector_name)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_v2_backtest_horizon
+            ON sector_v2_backtest_samples (horizon_sessions, sample_date)
+        """)
         conn.commit()
 
 
@@ -393,7 +487,7 @@ def record_sector_score_predictions(data: dict, sector_scores: dict) -> dict:
             int(score["graph_score"]),
             int(score["news_adjustment"]),
             int(score.get("calibration_adjustment", 0)),
-            int(score["final_score"]),
+            int(score.get("legacy_final_score", score["final_score"])),
             sector_close,
             benchmark_close,
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -761,3 +855,374 @@ def get_sector_score_calibration(graph_scores: dict[str, int]) -> dict:
                 "minimum_cases_for_adjustment": CALIBRATION_MIN_ADJUSTMENT_CASES,
             }
     return calibration
+
+
+# ── Recommendation V2 feature ledger and evaluation ─────────────────────────
+
+def record_v2_recommendation_bundle(
+    data: dict,
+    bundle: dict,
+    legacy_scores: dict,
+    active_model: str,
+) -> dict:
+    """Persist inputs, historical audit cases, evaluations and live forecasts."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    benchmark = data.get("indices", {}).get("ת״א-125", {})
+    benchmark_close = _safe_float(
+        benchmark.get("trend", {}).get("last_close")
+        or benchmark.get("last_value")
+    )
+    if benchmark_close is None:
+        return {
+            "v2_features_upserted": 0,
+            "v2_predictions_upserted": 0,
+            "reason": "benchmark_close_missing",
+        }
+
+    feature_rows = []
+    prediction_rows = []
+    for sector_name, recommendation in bundle.get("sectors", {}).items():
+        sector = data.get("sectors", {}).get(sector_name, {})
+        sector_close = _safe_float(
+            sector.get("trend", {}).get("last_close")
+            or sector.get("last_value")
+        )
+        features = recommendation.get("features", {})
+        trade_date = features.get("data_date")
+        if not trade_date or sector_close is None:
+            continue
+        features_json = json.dumps(
+            features, ensure_ascii=False, separators=(",", ":")
+        )
+        feature_rows.append((
+            trade_date,
+            sector_name,
+            bundle["feature_version"],
+            features_json,
+            sector_close,
+            benchmark_close,
+            now,
+        ))
+        legacy_item = legacy_scores.get(sector_name, {})
+        legacy_score = int(legacy_item.get(
+            "legacy_final_score", legacy_item.get("final_score", 50)
+        ))
+        catalyst_json = json.dumps(
+            recommendation.get("catalyst", {}),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for horizon, forecast in recommendation.get("horizons", {}).items():
+            prediction_rows.append((
+                trade_date,
+                sector_name,
+                int(horizon),
+                bundle["model_version"],
+                bundle["feature_version"],
+                int(forecast["final_score"]),
+                legacy_score,
+                float(forecast["probability_positive_pct"]),
+                float(forecast["probability_outperform_pct"]),
+                int(forecast["risk_quality"]),
+                int(forecast["confidence_pct"]),
+                float(forecast["expected_excess_return_pct"]),
+                _safe_float(forecast.get("expected_excess_low_pct")),
+                _safe_float(forecast.get("expected_excess_high_pct")),
+                int(forecast.get("news_catalyst_adjustment", 0)),
+                active_model,
+                features_json,
+                catalyst_json,
+                sector_close,
+                benchmark_close,
+                now,
+            ))
+
+    backtest_rows = []
+    for sample in bundle.get("historical_samples", []):
+        features_json = json.dumps(
+            sample["features"], ensure_ascii=False, separators=(",", ":")
+        )
+        for horizon, outcome in sample.get("outcomes", {}).items():
+            backtest_rows.append((
+                sample["sample_date"],
+                sample["sector_name"],
+                int(horizon),
+                bundle["feature_version"],
+                features_json,
+                outcome["outcome_date"],
+                float(outcome["sector_return_pct"]),
+                float(outcome["benchmark_return_pct"]),
+                float(outcome["excess_return_pct"]),
+                int(outcome["positive"]),
+                int(outcome["outperformed"]),
+                float(outcome["max_drawdown_pct"]),
+                now,
+            ))
+
+    evaluation_date = max(
+        (row[0] for row in feature_rows),
+        default=datetime.now(timezone.utc).date().isoformat(),
+    )
+    evaluation_rows = [
+        (
+            evaluation_date,
+            bundle["model_version"],
+            int(horizon),
+            json.dumps(metrics, ensure_ascii=False, separators=(",", ":")),
+            now,
+        )
+        for horizon, metrics in bundle.get("evaluation", {}).items()
+    ]
+
+    with get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO sector_v2_feature_snapshots
+                (trade_date, sector_name, feature_version, features_json,
+                 sector_close, benchmark_close, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date, sector_name, feature_version) DO UPDATE SET
+                features_json = excluded.features_json,
+                sector_close = excluded.sector_close,
+                benchmark_close = excluded.benchmark_close,
+                created_at = excluded.created_at
+            """,
+            feature_rows,
+        )
+        conn.executemany(
+            """
+            INSERT INTO sector_v2_backtest_samples
+                (sample_date, sector_name, horizon_sessions, feature_version,
+                 features_json, outcome_date, sector_return_pct,
+                 benchmark_return_pct, excess_return_pct, positive,
+                 outperformed, max_drawdown_pct, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                sample_date, sector_name, horizon_sessions, feature_version
+            ) DO UPDATE SET
+                features_json = excluded.features_json,
+                outcome_date = excluded.outcome_date,
+                sector_return_pct = excluded.sector_return_pct,
+                benchmark_return_pct = excluded.benchmark_return_pct,
+                excess_return_pct = excluded.excess_return_pct,
+                positive = excluded.positive,
+                outperformed = excluded.outperformed,
+                max_drawdown_pct = excluded.max_drawdown_pct,
+                created_at = excluded.created_at
+            """,
+            backtest_rows,
+        )
+        conn.executemany(
+            """
+            INSERT INTO sector_v2_predictions
+                (trade_date, sector_name, horizon_sessions, model_version,
+                 feature_version, score, legacy_score,
+                 probability_positive_pct, probability_outperform_pct,
+                 risk_quality, confidence_pct, expected_excess_return_pct,
+                 expected_excess_low_pct, expected_excess_high_pct,
+                 news_adjustment, active_model, features_json, catalyst_json,
+                 sector_close, benchmark_close, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                trade_date, sector_name, horizon_sessions, model_version
+            ) DO UPDATE SET
+                score = excluded.score,
+                legacy_score = excluded.legacy_score,
+                probability_positive_pct = excluded.probability_positive_pct,
+                probability_outperform_pct = excluded.probability_outperform_pct,
+                risk_quality = excluded.risk_quality,
+                confidence_pct = excluded.confidence_pct,
+                expected_excess_return_pct = excluded.expected_excess_return_pct,
+                expected_excess_low_pct = excluded.expected_excess_low_pct,
+                expected_excess_high_pct = excluded.expected_excess_high_pct,
+                news_adjustment = excluded.news_adjustment,
+                active_model = excluded.active_model,
+                features_json = excluded.features_json,
+                catalyst_json = excluded.catalyst_json,
+                sector_close = excluded.sector_close,
+                benchmark_close = excluded.benchmark_close,
+                created_at = excluded.created_at
+            """,
+            prediction_rows,
+        )
+        conn.executemany(
+            """
+            INSERT INTO recommendation_model_evaluations
+                (evaluation_date, model_version, horizon_sessions,
+                 metrics_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(
+                evaluation_date, model_version, horizon_sessions
+            ) DO UPDATE SET
+                metrics_json = excluded.metrics_json,
+                created_at = excluded.created_at
+            """,
+            evaluation_rows,
+        )
+        conn.commit()
+    return {
+        "v2_features_upserted": len(feature_rows),
+        "v2_backtest_rows_upserted": len(backtest_rows),
+        "v2_predictions_upserted": len(prediction_rows),
+        "v2_evaluations_upserted": len(evaluation_rows),
+    }
+
+
+def settle_v2_prediction_outcomes() -> dict:
+    """Settle live V2 forecasts after their exact TASE-session horizon."""
+    settled = 0
+    with get_connection() as conn:
+        predictions = conn.execute(
+            """
+            SELECT p.id, p.trade_date, p.sector_name, p.horizon_sessions,
+                   p.sector_close, p.benchmark_close
+            FROM sector_v2_predictions p
+            LEFT JOIN sector_v2_outcomes o ON o.prediction_id = p.id
+            WHERE o.prediction_id IS NULL
+            ORDER BY p.trade_date, p.sector_name, p.horizon_sessions
+            """
+        ).fetchall()
+        for prediction in predictions:
+            target = conn.execute(
+                """
+                SELECT trade_date, close_value
+                FROM market_close_history
+                WHERE instrument_name = ? AND trade_date > ?
+                ORDER BY trade_date
+                LIMIT 1 OFFSET ?
+                """,
+                (
+                    prediction["sector_name"],
+                    prediction["trade_date"],
+                    prediction["horizon_sessions"] - 1,
+                ),
+            ).fetchone()
+            if target is None:
+                continue
+            benchmark_target = conn.execute(
+                """
+                SELECT close_value FROM market_close_history
+                WHERE instrument_name = 'ת״א-125' AND trade_date = ?
+                """,
+                (target["trade_date"],),
+            ).fetchone()
+            if benchmark_target is None:
+                continue
+            path = conn.execute(
+                """
+                SELECT close_value FROM market_close_history
+                WHERE instrument_name = ? AND trade_date > ? AND trade_date <= ?
+                ORDER BY trade_date
+                """,
+                (
+                    prediction["sector_name"],
+                    prediction["trade_date"],
+                    target["trade_date"],
+                ),
+            ).fetchall()
+            values = [prediction["sector_close"]] + [row[0] for row in path]
+            peak = values[0]
+            max_drawdown = 0.0
+            for value in values:
+                peak = max(peak, value)
+                max_drawdown = min(max_drawdown, ((value / peak) - 1) * 100)
+            sector_return = (
+                (target["close_value"] / prediction["sector_close"]) - 1
+            ) * 100
+            benchmark_return = (
+                (benchmark_target["close_value"] / prediction["benchmark_close"]) - 1
+            ) * 100
+            excess_return = sector_return - benchmark_return
+            conn.execute(
+                """
+                INSERT INTO sector_v2_outcomes
+                    (prediction_id, outcome_date, sector_return_pct,
+                     benchmark_return_pct, excess_return_pct, positive,
+                     outperformed, max_drawdown_pct)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    prediction["id"],
+                    target["trade_date"],
+                    round(sector_return, 4),
+                    round(benchmark_return, 4),
+                    round(excess_return, 4),
+                    int(sector_return > 0),
+                    int(excess_return > 0),
+                    round(max_drawdown, 4),
+                ),
+            )
+            settled += 1
+        conn.commit()
+    return {"v2_outcomes_settled": settled}
+
+
+def get_v2_live_comparison(horizon: int = 20) -> dict:
+    """Compare matured V2 probabilities with the legacy score out of sample."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.probability_outperform_pct, p.legacy_score,
+                   o.outperformed, o.excess_return_pct
+            FROM sector_v2_predictions p
+            JOIN sector_v2_outcomes o ON o.prediction_id = p.id
+            WHERE p.horizon_sessions = ?
+            """,
+            (horizon,),
+        ).fetchall()
+    if not rows:
+        return {
+            "sample_size": 0,
+            "eligible_for_promotion": False,
+            "active_model": "v1",
+        }
+    v2_brier = sum(
+        ((row["probability_outperform_pct"] / 100) - row["outperformed"]) ** 2
+        for row in rows
+    ) / len(rows)
+    legacy_brier = sum(
+        ((row["legacy_score"] / 100) - row["outperformed"]) ** 2
+        for row in rows
+    ) / len(rows)
+    v2_accuracy = sum(
+        (row["probability_outperform_pct"] >= 50) == bool(row["outperformed"])
+        for row in rows
+    ) / len(rows)
+    legacy_accuracy = sum(
+        (row["legacy_score"] >= 50) == bool(row["outperformed"])
+        for row in rows
+    ) / len(rows)
+    eligible = (
+        len(rows) >= 60
+        and v2_brier <= legacy_brier * 0.95
+        and v2_accuracy >= legacy_accuracy
+    )
+    return {
+        "sample_size": len(rows),
+        "v2_brier": round(v2_brier, 4),
+        "legacy_brier": round(legacy_brier, 4),
+        "v2_accuracy_pct": round(v2_accuracy * 100, 1),
+        "legacy_accuracy_pct": round(legacy_accuracy * 100, 1),
+        "avg_excess_return_pct": round(
+            sum(row["excess_return_pct"] for row in rows) / len(rows), 2
+        ),
+        "eligible_for_promotion": eligible,
+        "active_model": "v2" if eligible else "v1",
+    }
+
+
+def choose_active_recommendation_model(configured_mode: str) -> dict:
+    """Resolve shadow/manual/automatic promotion without hiding the evidence."""
+    mode = (configured_mode or "shadow").lower()
+    comparison = get_v2_live_comparison()
+    if mode == "active":
+        active_model = "v2"
+    elif mode == "auto" and comparison.get("eligible_for_promotion"):
+        active_model = "v2"
+    else:
+        active_model = "v1"
+    return {
+        "configured_mode": mode,
+        "active_model": active_model,
+        "comparison": comparison,
+    }

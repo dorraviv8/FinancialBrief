@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 import database
+import recommendation_v2
 from israel_market import collect_israeli_market_data
 
 
@@ -180,23 +181,59 @@ def _compact_sector_payload(data: dict, selected_names: list[str] | None = None)
 def _compact_sector_overview(
     data: dict,
     calibration: dict | None = None,
+    v2_bundle: dict | None = None,
 ) -> dict:
     calibration = calibration or {}
+    v2_bundle = v2_bundle or {}
     return {
         "as_of": data.get("as_of"),
         "sectors": {
             name: {
                 "graph_score_0_100": calculate_sector_graph_score(sector),
-                "historical_calibration_adjustment": calibration.get(name, {}).get(
-                    "adjustment", 0
-                ),
-                "change_1d_pct": sector.get("change_1d_pct"),
-                "breadth": sector.get("breadth"),
-                "trend": _compact_technical(sector.get("trend")),
                 "largest_stocks": [
                     stock.get("symbol") or stock.get("name")
                     for stock in sector.get("top_stocks_by_market_cap", [])
                 ],
+                "v2_shadow": {
+                    "horizon_scores_10_20_30": [
+                        v2_bundle.get("sectors", {})
+                        .get(name, {})
+                        .get("horizons", {})
+                        .get(horizon, {})
+                        .get("final_score")
+                        for horizon in recommendation_v2.HORIZONS
+                    ],
+                    "probability_positive_20d_pct": (
+                        v2_bundle.get("sectors", {})
+                        .get(name, {})
+                        .get("horizons", {})
+                        .get(20, {})
+                        .get("probability_positive_pct")
+                    ),
+                    "probability_outperform_20d_pct": (
+                        v2_bundle.get("sectors", {})
+                        .get(name, {})
+                        .get("horizons", {})
+                        .get(20, {})
+                        .get("probability_outperform_pct")
+                    ),
+                    "risk_quality": (
+                        v2_bundle.get("sectors", {})
+                        .get(name, {})
+                        .get("risk_quality")
+                    ),
+                    "price_state": {
+                        key: v2_bundle.get("sectors", {})
+                        .get(name, {})
+                        .get("features", {})
+                        .get(key)
+                        for key in (
+                            "relative_return_20d_pct",
+                            "relative_return_63d_pct",
+                            "sector_drawdown_60d_pct",
+                        )
+                    },
+                },
             }
             for name, sector in data.get("sectors", {}).items()
         },
@@ -205,20 +242,194 @@ def _compact_sector_overview(
 
 def _compact_sector_news(data: dict) -> list[dict]:
     items = []
-    for item in data.get("maya_announcements", [])[:5]:
+    for position, item in enumerate(data.get("maya_announcements", [])[:5]):
         items.append({
+            "id": f"M{position}",
             "source": item.get("source"),
             "reliability": item.get("reliability"),
             "title": item.get("title"),
             "companies": item.get("companies", []),
+            "published": item.get("published"),
         })
-    for item in data.get("news", [])[:8]:
+    for position, item in enumerate(data.get("news", [])[:8]):
         items.append({
+            "id": f"N{position}",
             "source": item.get("source"),
             "reliability": item.get("reliability"),
             "title": item.get("title"),
+            "published": item.get("published"),
         })
     return items
+
+
+def _parse_published_time(value) -> datetime | None:
+    if not value:
+        return None
+
+
+SECTOR_NEWS_KEYWORDS = {
+    "טכנולוגיה": ("טכנולוג", "סייבר", "תוכנה", "שבבים", "מוליכים למחצה"),
+    "ביומד": ("ביומד", "פארמה", "תרופ", "רפוא", "טבע", "בריינסוויי"),
+    "בנקים": ("בנק", "לאומי", "פועלים", "מזרחי", "דיסקונט"),
+    "ביטוח ושירותים פיננסיים": (
+        "ביטוח", "פיננס", "אשראי", "הפניקס", "הראל", "מנורה"
+    ),
+    "נדל״ן ובנייה": (
+        "נדל", "בנייה", "בניה", "דיור", "דירות", "אאורה", "עזריאלי", "מליסרון"
+    ),
+    "תעשייה": ("תעש", "מפעל", "ייצור", "יצרנית"),
+    "מסחר ושירותים": ("קמעונ", "מסחר", "שירותים", "רשת חנויות"),
+    "השקעות ואחזקות": ("אחזקות", "החזקות", "חברת השקעות"),
+    "אנרגיה ותשתיות": (
+        "אנרג", "תשתיות", "חשמל", "אנלייט", "או פי סי", "אורמת"
+    ),
+    "נפט וגז": (
+        "נפט", "גז טבעי", "קידוח", "ניו מד", "ניו-מד", "נאוויטס",
+        "קבוצת דלק", "דלק קבוצה"
+    ),
+}
+
+
+def _normalized_relevance_text(value) -> str:
+    return " ".join(
+        re.sub(r"[^0-9a-zA-Zא-ת]+", " ", str(value or "").lower()).split()
+    )
+
+
+def _news_item_relevant_to_sector(data: dict, sector_name: str, item: dict) -> bool:
+    """Reject plausible-sounding but unsupported AI sector/news associations."""
+    text_parts = [item.get("title")]
+    text_parts.extend(item.get("companies") or [])
+    haystack = _normalized_relevance_text(" ".join(
+        str(part) for part in text_parts if part
+    ))
+    if not haystack:
+        return False
+    if any(
+        _normalized_relevance_text(keyword) in haystack
+        for keyword in SECTOR_NEWS_KEYWORDS.get(sector_name, ())
+    ):
+        return True
+    sector = data.get("sectors", {}).get(sector_name, {})
+    for stock in sector.get("top_stocks_by_market_cap", []):
+        for identifier in (stock.get("name"), stock.get("symbol")):
+            normalized = _normalized_relevance_text(identifier)
+            if len(normalized) >= 4 and normalized in haystack:
+                return True
+    return False
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ISRAEL_TZ)
+        return parsed.astimezone(ISRAEL_TZ)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_news_catalysts(data: dict, ai_text: str) -> dict:
+    """Convert AI event classification into bounded, source-aware points."""
+    news_items = _compact_sector_news(data)
+    by_id = {item["id"]: item for item in news_items}
+    catalysts = {}
+    for line in ai_text.splitlines():
+        if not line.startswith("CATALYST|"):
+            continue
+        parts = line.split("|", 7)
+        if len(parts) == 8:
+            (
+                _marker,
+                sector_name,
+                item_id,
+                event_type,
+                direction_text,
+                materiality_text,
+                duration_text,
+                reason,
+            ) = parts
+        elif len(parts) == 7:
+            # Compatibility with the first V2 protocol used in fixtures.
+            _marker, sector_name, item_id, direction_text, materiality_text, duration_text, reason = parts
+            event_type = "other"
+        else:
+            continue
+        sector_name = sector_name.strip()
+        item_id = item_id.strip().upper()
+        event_type = event_type.strip().lower()
+        allowed_event_types = {
+            "earnings", "guidance", "regulatory", "rates", "currency",
+            "commodity", "corporate", "macro", "other", "none",
+        }
+        if event_type not in allowed_event_types:
+            event_type = "other"
+        if sector_name not in data.get("sectors", {}):
+            continue
+        if item_id == "NONE":
+            catalysts[sector_name] = {
+                "adjustment": 0,
+                "reason": reason.strip()[:280] or "לא זוהה אירוע מהותי.",
+                "news_id": None,
+                "event_type": "none",
+            }
+            continue
+        item = by_id.get(item_id)
+        if not item:
+            continue
+        try:
+            direction = max(-1, min(1, int(direction_text.strip())))
+            materiality = max(0, min(5, int(materiality_text.strip())))
+            duration_days = max(1, min(30, int(duration_text.strip())))
+        except ValueError:
+            continue
+        if not _news_item_relevant_to_sector(data, sector_name, item):
+            continue
+        reliability_weight = 1.0 if item.get("reliability") == "official" else 0.7
+        published = _parse_published_time(item.get("published"))
+        age_days = max(
+            0.0,
+            ((_today() - published).total_seconds() / 86400) if published else 1.0,
+        )
+        freshness = 0.5 ** (age_days / duration_days)
+        adjustment = int(round(
+            direction * materiality * reliability_weight * freshness
+        ))
+        catalysts[sector_name] = {
+            "adjustment": max(-5, min(5, adjustment)),
+            "direction": direction,
+            "materiality": materiality,
+            "duration_days": duration_days,
+            "reliability": item.get("reliability"),
+            "source": item.get("source"),
+            "news_id": item_id,
+            "event_type": event_type,
+            "title": item.get("title"),
+            "reason": reason.strip().replace("**", "")[:280],
+            "relevance_verified": True,
+        }
+
+    # Backward-compatible fallback for saved fixtures and older model output.
+    if not catalysts:
+        for line in ai_text.splitlines():
+            if not line.startswith("SCORE|"):
+                continue
+            parts = line.split("|", 3)
+            if len(parts) != 4 or parts[1].strip() not in data.get("sectors", {}):
+                continue
+            try:
+                adjustment = max(-5, min(5, int(parts[2].strip())))
+            except ValueError:
+                continue
+            catalysts[parts[1].strip()] = {
+                "adjustment": adjustment,
+                "reason": parts[3].strip()[:280],
+                "news_id": None,
+            }
+    for sector_name in data.get("sectors", {}):
+        catalysts.setdefault(sector_name, {
+            "adjustment": 0,
+            "reason": "לא זוהה אירוע חדשותי מהותי ומאומת לסקטור.",
+            "news_id": None,
+        })
+    return catalysts
 
 
 def _clamp(value: float, minimum: float = 0, maximum: float = 100) -> float:
@@ -356,9 +567,100 @@ def _parse_sector_scores(
     return scores
 
 
+def _legacy_scores_from_catalysts(
+    data: dict,
+    catalysts: dict,
+    calibration: dict | None = None,
+) -> dict:
+    """Keep V1 reproducible while replacing subjective AI points with catalysts."""
+    calibration = calibration or {}
+    scores = {}
+    for name, sector in data.get("sectors", {}).items():
+        graph_score = calculate_sector_graph_score(sector)
+        news_adjustment = int(max(
+            -5, min(5, catalysts.get(name, {}).get("adjustment", 0))
+        ))
+        calibration_adjustment = int(max(
+            -5, min(5, calibration.get(name, {}).get("adjustment", 0))
+        ))
+        final_score = int(round(_clamp(
+            graph_score + news_adjustment + calibration_adjustment
+        )))
+        scores[name] = {
+            "graph_score": graph_score,
+            "news_adjustment": news_adjustment,
+            "calibration_adjustment": calibration_adjustment,
+            "final_score": final_score,
+            "legacy_final_score": final_score,
+            "label": _sector_score_label(final_score),
+            "reason": catalysts.get(name, {}).get("reason") or (
+                "לא זוהה אירוע חדשותי מהותי ומאומת לסקטור."
+            ),
+        }
+    return scores
+
+
+def _combine_recommendation_scores(
+    legacy_scores: dict,
+    v2_bundle: dict,
+    model_status: dict,
+) -> dict:
+    active_model = model_status.get("active_model", "v1")
+    combined = {}
+    for name, legacy in legacy_scores.items():
+        item = dict(legacy)
+        v2 = v2_bundle.get("sectors", {}).get(name, {})
+        primary = v2.get("horizons", {}).get(20, {})
+        item.update({
+            "active_model": active_model,
+            "v2_score": primary.get("final_score", 50),
+            "v2_confidence_pct": primary.get("confidence_pct", 0),
+            "v2_probability_positive_pct": primary.get(
+                "probability_positive_pct", 50
+            ),
+            "v2_probability_outperform_pct": primary.get(
+                "probability_outperform_pct", 50
+            ),
+            "v2_expected_excess_return_pct": primary.get(
+                "expected_excess_return_pct", 0
+            ),
+            "v2_expected_excess_low_pct": primary.get(
+                "expected_excess_low_pct"
+            ),
+            "v2_expected_excess_high_pct": primary.get(
+                "expected_excess_high_pct"
+            ),
+            "v2_risk_quality": primary.get("risk_quality", 50),
+            "v2_live_sample_size": model_status.get("comparison", {}).get(
+                "sample_size", 0
+            ),
+            "v2_backtest_sample_size": v2_bundle.get("evaluation", {})
+            .get(20, {})
+            .get("sample_count", 0),
+            "v2_backtest_brier_skill_pct": v2_bundle.get("evaluation", {})
+            .get(20, {})
+            .get("outperform_brier_skill_pct"),
+            "v2_backtest_top_three_excess_pct": v2_bundle.get("evaluation", {})
+            .get(20, {})
+            .get("top_three_avg_excess_return_pct"),
+            "v2_horizon_scores": {
+                horizon: v2.get("horizons", {}).get(horizon, {}).get(
+                    "final_score", 50
+                )
+                for horizon in recommendation_v2.HORIZONS
+            },
+        })
+        if active_model == "v2":
+            item["final_score"] = int(item["v2_score"])
+            item["label"] = _sector_score_label(item["final_score"])
+        combined[name] = item
+    return combined
+
+
 def _strip_score_protocol(ai_text: str) -> str:
     return "\n".join(
-        line for line in ai_text.splitlines() if not line.startswith("SCORE|")
+        line for line in ai_text.splitlines()
+        if not line.startswith(("SCORE|", "CATALYST|"))
     ).strip()
 
 
@@ -748,6 +1050,78 @@ def build_reader_dashboard(
     return "### מה השתנה ומה חשוב הבוקר\n" + "\n".join(lines)
 
 
+def build_sector_recommendation_summary(
+    sector_scores: dict,
+    v2_bundle: dict,
+) -> str:
+    """Render decision prose from verified model fields, not free-form AI text."""
+    ranked = sorted(
+        sector_scores,
+        key=lambda name: sector_scores[name].get("v2_score", 50),
+        reverse=True,
+    )
+    if not ranked:
+        return (
+            "### סקטורים בולטים ותובנות AI\n"
+            "- אין נתוני סקטורים זמינים.\n\n"
+            "### מבט סקטוריאלי להמשך\n"
+            "- אין בסיס מספק לתרחיש סקטוריאלי."
+        )
+
+    def evidence(name: str) -> str:
+        score = sector_scores[name]
+        catalyst = v2_bundle.get("sectors", {}).get(name, {}).get("catalyst", {})
+        catalyst_text = (
+            f" אירוע מאומת: {catalyst.get('reason')}"
+            if catalyst.get("adjustment")
+            else " לא זוהה אירוע חדשותי מאומת ששינה את הציון."
+        )
+        return (
+            f"V2 {score.get('v2_score', 50)}/100, סיכוי לתשואה חיובית "
+            f"{_format_number(score.get('v2_probability_positive_pct'), 1)}%, "
+            f"סיכוי לעקוף את ת״א-125 "
+            f"{_format_number(score.get('v2_probability_outperform_pct'), 1)}%, "
+            f"ואיכות סיכון {score.get('v2_risk_quality', 50)}/100."
+            f"{catalyst_text}"
+        )
+
+    preferred = ranked[0]
+    watch = ranked[1] if len(ranked) > 1 else ranked[0]
+    wait = min(
+        (name for name in ranked if name not in {preferred, watch}),
+        key=lambda name: abs(sector_scores[name].get("v2_score", 50) - 50),
+        default=ranked[-1],
+    )
+    weak = ranked[-2:] if len(ranked) >= 2 else ranked
+    weak_text = ", ".join(
+        f"{name} ({sector_scores[name].get('v2_score', 50)})" for name in weak
+    )
+
+    preferred_horizons = sector_scores[preferred].get("v2_horizon_scores", {})
+    near_score = preferred_horizons.get(10, 50)
+    long_score = preferred_horizons.get(30, 50)
+    durability = (
+        "היתרון מתחזק באופק הארוך יותר"
+        if long_score >= near_score + 3
+        else "היתרון חזק יותר בטווח הקרוב"
+        if near_score >= long_score + 3
+        else "ההערכה דומה בין שבועיים לשישה שבועות"
+    )
+    return "\n\n".join((
+        "### סקטורים בולטים ותובנות AI\n"
+        f"- **מועדף לבדיקה – {preferred}:** {evidence(preferred)}\n"
+        f"- **מעקב – {watch}:** {evidence(watch)}\n"
+        f"- **ניטרלי כעת – {wait}:** {evidence(wait)}\n"
+        f"- **החלשים ב-V2:** {weak_text}; הציון המשולב שלהם נמוך יחסית לשאר הסקטורים.",
+        "### מבט סקטוריאלי להמשך\n"
+        f"- **תרחיש בסיס:** {preferred} ו{watch} מובילים כעת; {durability}.\n"
+        "- **תרחיש חיובי:** שיפור ברוחב הסקטורים ועלייה בסיכוי לעקוף את ת״א-125 "
+        "במדידה הבאה יחזקו את ההערכה.\n"
+        "- **תרחיש שלילי:** היחלשות בשלוש המניות הגדולות, עלייה בתנודתיות או "
+        "ירידה בהסתברות לתשואה חיובית יפחיתו את הציונים.",
+    ))
+
+
 def _compact_trend_sentence(sector: dict) -> str:
     trend = sector.get("trend", {})
     if not trend.get("available"):
@@ -807,6 +1181,15 @@ def _selected_sector_names(
         reverse=True,
     )
     selected = ranked[:3]
+    if any("v2_score" in score for score in sector_scores.values()):
+        v2_ranked = sorted(
+            sector_scores,
+            key=lambda name: sector_scores[name].get("v2_score", 50),
+            reverse=True,
+        )
+        for name in v2_ranked[:2]:
+            if name not in selected and len(selected) < maximum:
+                selected.append(name)
     extras = sorted(
         (
             name for name in ranked[3:]
@@ -865,17 +1248,45 @@ def build_reader_quantitative_cards(
         key=lambda name: sector_scores[name]["final_score"],
         reverse=True,
     )
+    active_model = next(iter(sector_scores.values()), {}).get(
+        "active_model", "v1"
+    )
+    if active_model == "v2":
+        model_note = (
+            "V2 הוא המודל הפעיל: הציון משלב הסתברות לתשואה חיובית, "
+            "סיכוי לעקוף את ת״א-125, סיכון וביטחון."
+        )
+    else:
+        model_evidence = next(iter(sector_scores.values()), {})
+        live_sample_size = model_evidence.get("v2_live_sample_size", 0)
+        backtest_size = model_evidence.get("v2_backtest_sample_size", 0)
+        brier_skill = model_evidence.get("v2_backtest_brier_skill_pct")
+        top_three_excess = model_evidence.get("v2_backtest_top_three_excess_pct")
+        calibration_result = (
+            f"כיול ההסתברות שיפר את קו הבסיס ב-{_format_number(brier_skill, 1)}%"
+            if brier_skill is not None and brier_skill > 0
+            else "כיול ההסתברות עדיין לא הראה יתרון על קו הבסיס"
+        )
+        model_note = (
+            "V2 פועל כעת במצב צל ונמדד מול הציון הפעיל. הוא יוכל להפוך "
+            "לפעיל רק לאחר לפחות 60 תחזיות אמת שהושלמו והציגו יתרון עקבי. "
+            f"הושלמו עד כה {live_sample_size} מתוך 60. בבדיקה כרונולוגית "
+            f"של {backtest_size} מקרים לאופק 4 שבועות, שלושת המדורגים ראשונים "
+            f"השיגו בממוצע {_format_pct(top_three_excess)} מול ת״א-125; "
+            f"{calibration_result}."
+        )
     ranking_rows = [
-        "| # | סקטור | ציון | שינוי בציון | מגמת חודש |",
-        "|---:|---|---:|---:|---:|",
+        "| # | סקטור | ציון פעיל | V2 ל-4 שבועות | סיכוי לחיובי | סיכוי לעקוף ת״א-125 | רמת ביטחון |",
+        "|---:|---|---:|---:|---:|---:|---|",
     ]
     for position, name in enumerate(ranked, 1):
-        sector = data.get("sectors", {}).get(name, {})
         score = sector_scores[name]
         ranking_rows.append(
             f"| {position} | {name} | {score['final_score']} – {score['label']} | "
-            f"{_score_delta_text(_score_delta(name, score, previous_scores))} | "
-            f"{_format_pct(sector.get('trend', {}).get('return_20d_pct'))} |"
+            f"{score.get('v2_score', 50)} | "
+            f"{_format_number(score.get('v2_probability_positive_pct'), 1)}% | "
+            f"{_format_number(score.get('v2_probability_outperform_pct'), 1)}% | "
+            f"{recommendation_v2.confidence_label(score.get('v2_confidence_pct', 0))} |"
         )
     calibration_ready = any(
         (stats.get("sample_size") or 0)
@@ -891,7 +1302,7 @@ def build_reader_quantitative_cards(
     ranking_card = (
         "### דירוג כל הסקטורים\n"
         "הציון מודד אטרקטיביות יחסית ל-2–6 שבועות; הוא אינו הבטחת תשואה. "
-        + calibration_note + "\n" + "\n".join(ranking_rows)
+        + model_note + " " + calibration_note + "\n" + "\n".join(ranking_rows)
     )
 
     detail_lines = []
@@ -902,6 +1313,20 @@ def build_reader_quantitative_cards(
             f"#### {name} – {score['final_score']}/100",
             f"- **למה הסקטור נבחר:** {_compact_trend_sentence(sector)}. {score['reason']}",
             f"- **מרכיבי הציון:** גרף {score['graph_score']}; חדשות {score['news_adjustment']:+d}; כיול {score.get('calibration_adjustment', 0):+d}. {_compact_calibration_sentence(calibration.get(name))}.",
+            "- **בדיקת V2 לפי אופק:** "
+            f"שבועיים {score.get('v2_horizon_scores', {}).get(10, 50)}/100; "
+            f"4 שבועות {score.get('v2_horizon_scores', {}).get(20, 50)}/100; "
+            f"6 שבועות {score.get('v2_horizon_scores', {}).get(30, 50)}/100.",
+            "- **הסתברויות V2 ל-4 שבועות:** "
+            f"תשואה חיובית {_format_number(score.get('v2_probability_positive_pct'), 1)}%; "
+            f"עקיפת ת״א-125 {_format_number(score.get('v2_probability_outperform_pct'), 1)}%; "
+            f"רמת ביטחון {recommendation_v2.confidence_label(score.get('v2_confidence_pct', 0))} "
+            f"({_format_number(score.get('v2_confidence_pct'), 0)}%); "
+            f"איכות סיכון {score.get('v2_risk_quality', 50)}/100.",
+            "- **טווח תשואה עודפת שנצפה במקרים דומים:** "
+            f"{_format_pct(score.get('v2_expected_excess_low_pct'))} עד "
+            f"{_format_pct(score.get('v2_expected_excess_high_pct'))}; "
+            "זהו טווח אמפירי ולא יעד תשואה.",
         ))
         stocks = []
         for stock in sector.get("top_stocks_by_market_cap", []):
@@ -955,6 +1380,17 @@ def build_reader_context_card(data: dict, sector_scores: dict) -> str:
         lines.append("- **שערי מט״ח מהותיים:** " + ", ".join(material_rates) + ".")
     else:
         lines.append("- **שערי מט״ח:** לא נרשמה תנועה יומית של 0.5% או יותר בדולר, באירו או בליש״ט.")
+
+    interest = data.get("boi_interest", {})
+    if interest.get("current_interest_pct") is not None:
+        next_decision = _parse_published_time(interest.get("next_decision_date"))
+        next_decision_text = (
+            next_decision.strftime("%d.%m.%Y") if next_decision else "לא זמין"
+        )
+        lines.append(
+            f"- **ריבית בנק ישראל:** {_format_number(interest.get('current_interest_pct'), 2)}%; "
+            f"החלטה הבאה: {next_decision_text}."
+        )
 
     source_links = []
     ta125 = data.get("indices", {}).get("ת״א-125", {})
@@ -1041,6 +1477,8 @@ def generate_hebrew_brief(
     calibration: dict | None = None,
     previous_scores: dict | None = None,
     score_observer=None,
+    recommendation_observer=None,
+    model_status: dict | None = None,
 ) -> str:
     """Generate fact-grounded Israeli index and sector analysis in bounded calls."""
     if not GROQ_API_KEY:
@@ -1052,6 +1490,12 @@ def generate_hebrew_brief(
         max_retries=1,
     )
     model = GROQ_MODEL
+    model_status = model_status or {
+        "configured_mode": "shadow",
+        "active_model": "v1",
+        "comparison": {"sample_size": 0},
+    }
+    v2_base_bundle = recommendation_v2.build_recommendation_bundle(data)
     market_data = json.dumps(
         _compact_market_payload(data),
         ensure_ascii=False,
@@ -1061,7 +1505,7 @@ def generate_hebrew_brief(
 
     market_prompt = f"""אתה אנליסט הבורסה בתל אביב. כתוב בעברית תקנית וקצרה ל-{date_label}, על סמך הנתונים בלבד.
 
-כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, לממוצעי המחיר, לעוצמת הקונים והמוכרים, לכיוון התנועה, לתמיכה ולהתנגדות. הנתונים הטכניים הם אינדיקציה בלבד.
+כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, לממוצעי המחיר, לעוצמת הקונים והמוכרים, לכיוון התנועה, לתמיכה ולהתנגדות. הנתונים הטכניים הם אינדיקציה בלבד. השתמש במילים "מניות עולות" ו"מניות יורדות", לא בתרגום מילולי מאנגלית. אל תסיק השפעה על יבואנים, יצואנים או רווחי חברות משינוי מטבע בלבד. בדוק שכל משפט סיבתי נתמך ישירות בנתונים שסופקו ושמור על דקדוק עברי תקין.
 
 כתוב לקורא ללא רקע בניתוח טכני, עד 220 מילים ובדיוק את הסעיפים הבאים:
 ### תמונת מצב בבורסה בתל אביב
@@ -1077,41 +1521,36 @@ def generate_hebrew_brief(
 נתונים:
 {market_data}"""
 
-    sector_overview = json.dumps(
-        _compact_sector_overview(data, calibration),
+    sector_event_scope = json.dumps(
+        {
+            name: {
+                "largest_stocks": [
+                    stock.get("name") or stock.get("symbol")
+                    for stock in sector.get("top_stocks_by_market_cap", [])
+                ]
+            }
+            for name, sector in data.get("sectors", {}).items()
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    compact_news = _compact_sector_news(data)
     sector_news = json.dumps(
-        _compact_sector_news(data),
+        compact_news,
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    sector_prompt = f"""אתה אנליסט סקטורים של הבורסה בתל אביב. כתוב בעברית תקנית, קצרה וברורה.
+    sector_prompt = f"""אתה אנליסט אירועים של הבורסה בתל אביב. כתוב בעברית תקנית, קצרה וברורה, והשתמש רק בנתונים ובכותרות שסופקו.
 
-לכל סקטור כבר חושב graph_score_0_100 שקוף לפי ביצועי חודש/3/6/12 חודשים, רוחב, תנודתיות, ממוצעי מחיר, RSI, MACD ומגמה. historical_calibration_adjustment הוא כיול מוגבל של 5± נקודות על סמך מקרים היסטוריים שהושלמו. נתח את כותרות החדשות הישראליות שסופקו וקבע news_adjustment בין 10- ל-10+ בלבד. אם אין כותרת שקשורה ישירות לסקטור או לאחת המניות הגדולות בו, ההתאמה חייבת להיות 0. אל תשתמש בידע חיצוני ואל תמציא קשר סיבתי.
+אסור לך לבחור ציון או לכתוב המלצה. תפקידך היחיד הוא לזהות לכל סקטור לכל היותר אירוע חדשותי אחד, ישיר, עדכני ומהותי. דיווח רשמי עדיף על עיתונות. אין להשתמש בידע חיצוני, בכותרת שאינה קשורה ישירות לסקטור או לאחת משלוש המניות הגדולות בו, או באותה כותרת בלי קשר ברור. דמיון בשם אינו קשר: למשל "דלק רכב" אינה "קבוצת דלק", וחברת נדל״ן אינה חברת אנרגיה.
 
 בתחילת התשובה כתוב בדיוק עשר שורות מכונה, אחת לכל סקטור ובשמות שסופקו, בפורמט הבא וללא Markdown:
-SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10+|הסבר עברי קצר שמציין את החדשה או שאין חדשות מהותיות
+CATALYST|שם הסקטור|מזהה חדשות כגון M0/N2 או NONE|סוג אירוע earnings/guidance/regulatory/rates/currency/commodity/corporate/macro/other/none|כיוון -1/0/1|מהותיות 0-5|משך צפוי בימים 1-30|הסבר עברי קצר שמציין עובדה מהכותרת
 
-הציון הסופי הוא graph_score_0_100 ועוד התאמת החדשות ועוד historical_calibration_adjustment, מוגבל ל-0–100. לאחר עשר שורות SCORE, דרג את הסקטורים לפי הציון הסופי.
-
-כתוב לאחר שורות המכונה עד 170 מילים ובדיוק שני סעיפים. אין להשתמש בטבלה. כתוב רק את התבליטים המוגדרים:
-### סקטורים בולטים ותובנות AI
-- **מועדף – שם הסקטור והציון:** משפט אחד עם הסבר פשוט, סיכון ומה ישנה את ההערכה.
-- **מעקב – שם הסקטור והציון:** משפט אחד באותו מבנה.
-- **להמתין – שם הסקטור והציון:** משפט אחד באותו מבנה.
-- **חלשים:** משפט אחד שמציין את הסקטורים החלשים והסיבה.
-
-### מבט סקטוריאלי להמשך
-- **תרחיש בסיס:** משפט אחד, מובילים ורמת ביטחון.
-- **תרחיש חיובי:** משפט אחד, האירוע שישפר את המצב והסקטורים שיובילו.
-- **תרחיש שלילי:** משפט אחד, האירוע שיחליש את המצב והסקטורים הפגיעים.
-
-מקרא: ret_1m_3m_6m_1y_pct = תשואות חודש/3/6/12 חודשים; above_sma_20_50_200 = מעל ממוצעים 20/50/200; macd_hist = היסטוגרמת MACD; trendline_60d_200d_pct = קווי מגמה.
+אם אין אירוע ישיר ומהותי, השתמש בדיוק ב-NONE|none|0|0|1. earnings ו-guidance מיועדים לדוחות כספיים או תחזית חברה מפורשים בלבד. המערכת – ולא אתה – תחשב התאמה של עד 5± נקודות לפי כיוון, מהותיות, אמינות המקור וגיל הכותרת. אל תכתוב שום טקסט לפני או אחרי עשר שורות CATALYST.
 
 נתונים:
-סקטורים וגרפים: {sector_overview}
+סקטורים וחברות מובילות: {sector_event_scope}
 חדשות שסופקו: {sector_news}"""
 
     market_brief = _groq_completion(
@@ -1124,16 +1563,29 @@ SCORE|שם הסקטור|התאמת חדשות כמספר שלם בין 10- ל-10
         1,
     )
     sector_brief_raw = _groq_completion(
-        client, model, sector_prompt, max_tokens=1100, purpose="sectors"
+        client, model, sector_prompt, max_tokens=700, purpose="sector-events"
     )
-    _require_ai_sections(
-        sector_brief_raw,
-        ("סקטורים בולטים ותובנות AI", "מבט סקטוריאלי להמשך"),
+    catalysts = _parse_news_catalysts(data, sector_brief_raw)
+    v2_bundle = recommendation_v2.apply_catalysts(
+        v2_base_bundle, catalysts
     )
-    sector_scores = _parse_sector_scores(data, sector_brief_raw, calibration)
+    legacy_scores = _legacy_scores_from_catalysts(
+        data, catalysts, calibration
+    )
+    sector_scores = _combine_recommendation_scores(
+        legacy_scores, v2_bundle, model_status
+    )
     if score_observer is not None:
         score_observer(sector_scores)
-    sector_brief = _strip_score_protocol(sector_brief_raw)
+    if recommendation_observer is not None:
+        recommendation_observer({
+            "bundle": v2_bundle,
+            "model_status": model_status,
+            "catalysts": catalysts,
+        })
+    sector_brief = build_sector_recommendation_summary(
+        sector_scores, v2_bundle
+    )
     dashboard = build_reader_dashboard(sector_scores, previous_scores)
     quantitative_cards = build_reader_quantitative_cards(
         data,
@@ -1363,6 +1815,9 @@ def run(
         "close_rows_upserted": 0,
         "outcomes_settled": 0,
         "predictions_upserted": 0,
+        "v2_outcomes_settled": 0,
+        "v2_features_upserted": 0,
+        "v2_predictions_upserted": 0,
     }
 
     if existing_run:
@@ -1376,6 +1831,7 @@ def run(
         if send:
             tracking.update(database.record_market_close_history(data))
             tracking.update(database.settle_sector_score_outcomes())
+            tracking.update(database.settle_v2_prediction_outcomes())
 
         graph_scores = {
             name: calculate_sector_graph_score(sector)
@@ -1383,17 +1839,30 @@ def run(
         }
         calibration = database.get_sector_score_calibration(graph_scores)
         previous_scores = database.get_latest_sector_scores()
+        model_status = database.choose_active_recommendation_model(
+            os.getenv("RECOMMENDATION_V2_MODE", "shadow")
+        )
         generated_scores = {}
+        recommendation_capture = {}
         brief_text = generate_hebrew_brief(
             data,
             calibration=calibration,
             previous_scores=previous_scores,
             score_observer=generated_scores.update,
+            recommendation_observer=recommendation_capture.update,
+            model_status=model_status,
         )
         if send:
             tracking.update(database.record_sector_score_predictions(
                 data, generated_scores
             ))
+            if recommendation_capture.get("bundle"):
+                tracking.update(database.record_v2_recommendation_bundle(
+                    data,
+                    recommendation_capture["bundle"],
+                    generated_scores,
+                    model_status["active_model"],
+                ))
             market_close_date = (
                 data.get("indices", {})
                 .get("ת״א-125", {})
@@ -1518,6 +1987,9 @@ def main() -> None:
             "maya_announcements": len(data.get("maya_announcements", [])),
             "news_headlines": len(data.get("news", [])),
             "boi_rates": sorted(data.get("exchange_rates", {}).get("rates", {})),
+            "boi_interest_pct": data.get("boi_interest", {}).get(
+                "current_interest_pct"
+            ),
             "collection_stats": data.get("collection_stats", {}),
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))

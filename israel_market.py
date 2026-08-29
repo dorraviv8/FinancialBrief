@@ -29,6 +29,7 @@ ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 TASE_API_BASE = "https://api.tase.co.il/api"
 MAYA_API_BASE = "https://maya.tase.co.il/api/v1"
 BOI_RATES_URL = "https://www.boi.org.il/PublicApi/GetExchangeRates?asXml=false"
+BOI_INTEREST_URL = "https://www.boi.org.il/PublicApi/GetInterest"
 
 TASE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -92,6 +93,9 @@ HISTORY_CACHE_DIR = Path(
 HISTORY_CACHE_ENABLED = os.getenv("TASE_HISTORY_CACHE", "1") != "0"
 HISTORY_FULL_REFRESH_DAYS = max(
     1, int(os.getenv("TASE_HISTORY_FULL_REFRESH_DAYS", "7"))
+)
+HISTORY_RETENTION_DAYS = max(
+    400, int(os.getenv("TASE_HISTORY_RETENTION_DAYS", "1830"))
 )
 
 
@@ -302,7 +306,9 @@ def _write_history_cache(
 
 def _deduplicate_history(items: list[dict]) -> list[dict]:
     by_date = {}
-    cutoff = datetime.now(ISRAEL_TZ).date() - timedelta(days=400)
+    cutoff = datetime.now(ISRAEL_TZ).date() - timedelta(
+        days=HISTORY_RETENTION_DAYS
+    )
     for item in items:
         trade_date = item.get("TradeDate")
         if not trade_date:
@@ -375,7 +381,9 @@ def _get_tase_history(path: str, object_id: str, period_type: int = 4) -> list[d
             break
         items.extend(page_items)
 
-    items = _deduplicate_history(items)
+    # The endpoint supplies a trailing window. Keep older audited cache points
+    # so the recommendation engine grows toward a multi-year sample over time.
+    items = _deduplicate_history(items + (cache.get("items", []) if cache else []))
     _write_history_cache(path, object_id, items, today.isoformat())
     _increment_stat("history_full_refreshes")
     return items
@@ -518,6 +526,14 @@ def calculate_trend_metrics(history: list[dict]) -> dict:
     forecast_range = daily_vol * math.sqrt(15)
     positive_ratio = sum(value > 0 for value in daily_returns) / len(daily_returns)
 
+    def maximum_drawdown(sample: list[float]) -> float:
+        peak = sample[0]
+        drawdown = 0.0
+        for value in sample:
+            peak = max(peak, value)
+            drawdown = min(drawdown, _pct_change(value, peak))
+        return drawdown
+
     moving_averages = {
         period: _simple_moving_average(closes, period) for period in (20, 50, 200)
     }
@@ -573,6 +589,23 @@ def calculate_trend_metrics(history: list[dict]) -> dict:
         "above_sma_20": closes[-1] > moving_averages[20] if moving_averages[20] else None,
         "above_sma_50": closes[-1] > moving_averages[50] if moving_averages[50] else None,
         "above_sma_200": closes[-1] > moving_averages[200] if moving_averages[200] else None,
+        "distance_sma_20_pct": (
+            round(_pct_change(closes[-1], moving_averages[20]), 2)
+            if moving_averages[20]
+            else None
+        ),
+        "distance_sma_50_pct": (
+            round(_pct_change(closes[-1], moving_averages[50]), 2)
+            if moving_averages[50]
+            else None
+        ),
+        "distance_sma_200_pct": (
+            round(_pct_change(closes[-1], moving_averages[200]), 2)
+            if moving_averages[200]
+            else None
+        ),
+        "max_drawdown_60d_pct": round(maximum_drawdown(closes[-60:]), 2),
+        "max_drawdown_period_pct": round(maximum_drawdown(closes), 2),
         "rsi_14": round(rsi_value, 1) if rsi_value is not None else None,
         "macd": round(macd_value, 3) if macd_value is not None else None,
         "macd_signal": round(macd_signal, 3) if macd_signal is not None else None,
@@ -829,6 +862,20 @@ def get_boi_exchange_rates() -> dict:
     }
 
 
+def get_boi_interest_rate() -> dict:
+    """Fetch the current official policy rate without scraping prose."""
+    data = _request_json("GET", BOI_INTEREST_URL)
+    return {
+        "current_interest_pct": (
+            data.get("currentInterest") if isinstance(data, dict) else None
+        ),
+        "next_decision_date": (
+            data.get("nextInterestDate") if isinstance(data, dict) else None
+        ),
+        "source": "https://www.boi.org.il/PublicApi/GetInterest",
+    }
+
+
 def get_maya_announcements(limit: int = 5) -> list[dict]:
     safe_limit = max(1, min(limit, 5))
     data = _request_json(
@@ -929,6 +976,7 @@ def collect_israeli_market_data(
         "indices": indices,
         "sectors": sectors,
         "exchange_rates": get_boi_exchange_rates(),
+        "boi_interest": get_boi_interest_rate(),
         "maya_announcements": get_maya_announcements(),
         "news": get_israeli_news() if include_news else [],
         "collection_stats": get_collection_stats(),

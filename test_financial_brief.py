@@ -83,6 +83,7 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 1)
 
     @patch("israel_market.get_maya_announcements", return_value=[])
+    @patch("israel_market.get_boi_interest_rate", return_value={})
     @patch("israel_market.get_boi_exchange_rates", return_value={})
     @patch("israel_market.enrich_stock_technicals")
     @patch("israel_market.get_sector_analysis", return_value={})
@@ -93,6 +94,7 @@ class IsraelMarketTests(unittest.TestCase):
         mock_sectors,
         mock_enrich,
         _mock_boi,
+        _mock_interest,
         _mock_maya,
     ):
         israel_market.collect_israeli_market_data(
@@ -532,15 +534,16 @@ class IsraelMarketTests(unittest.TestCase):
 
         self.assertEqual(mock_completion.call_count, 2)
         self.assertEqual(mock_completion.call_args_list[0].kwargs["max_tokens"], 1200)
-        self.assertEqual(mock_completion.call_args_list[1].kwargs["max_tokens"], 1100)
+        self.assertEqual(mock_completion.call_args_list[1].kwargs["max_tokens"], 700)
         market_prompt = mock_completion.call_args_list[0].args[2]
         sector_prompt = mock_completion.call_args_list[1].args[2]
         self.assertIn("הכיוון הסביר", market_prompt)
         self.assertIn("מתי נשנה את ההערכה", market_prompt)
         self.assertIn("אסור להשתמש בלי הסבר", market_prompt)
-        self.assertIn("SCORE|שם הסקטור", sector_prompt)
-        self.assertIn("בין 10- ל-10+ בלבד", sector_prompt)
-        self.assertIn("historical_calibration_adjustment", sector_prompt)
+        self.assertIn("CATALYST|שם הסקטור", sector_prompt)
+        self.assertIn("מזהה חדשות", sector_prompt)
+        self.assertIn("עד 5± נקודות", sector_prompt)
+        self.assertIn("אסור לך לבחור ציון", sector_prompt)
         self.assertLess(
             brief.index("### מה השתנה ומה חשוב הבוקר"),
             brief.index("### דירוג כל הסקטורים"),
@@ -576,6 +579,67 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertIn("<ul dir=\"rtl\">", rendered)
         self.assertIn("מבט להמשך", rendered)
         self.assertNotIn("פרופיל משקיע", rendered)
+
+    def test_news_catalysts_are_source_weighted_freshness_adjustments(self):
+        fixed_now = datetime(
+            2026, 8, 28, 7, 0, tzinfo=financial_brief.ISRAEL_TZ
+        )
+        data = {
+            "sectors": {"בנקים": {}, "טכנולוגיה": {}},
+            "maya_announcements": [{
+                "source": "מאיה",
+                "reliability": "official",
+                "title": "דיווח רשמי של בנק לאומי",
+                "published": "2026-08-28T06:00:00+03:00",
+            }],
+            "news": [{
+                "source": "עיתונות",
+                "reliability": "financial_press",
+                "title": "רגולציה חדשה לענף הטכנולוגיה",
+                "published": "2026-08-28T06:00:00+03:00",
+            }],
+        }
+        protocol = (
+            "CATALYST|בנקים|M0|earnings|1|5|10|אירוע חיובי רשמי\n"
+            "CATALYST|טכנולוגיה|N0|regulatory|-1|5|10|אירוע שלילי בעיתונות"
+        )
+
+        with patch.object(financial_brief, "_today", return_value=fixed_now):
+            catalysts = financial_brief._parse_news_catalysts(data, protocol)
+
+        self.assertEqual(catalysts["בנקים"]["adjustment"], 5)
+        self.assertEqual(catalysts["טכנולוגיה"]["adjustment"], -3)
+        self.assertEqual(catalysts["בנקים"]["news_id"], "M0")
+        self.assertEqual(catalysts["בנקים"]["event_type"], "earnings")
+
+    def test_news_catalyst_rejects_name_collision_across_sectors(self):
+        data = {
+            "sectors": {"נפט וגז": {}, "אנרגיה ותשתיות": {}},
+            "maya_announcements": [],
+            "news": [
+                {
+                    "source": "כלכליסט",
+                    "reliability": "financial_press",
+                    "title": "דלק רכב קפצה לאחר הדוח",
+                    "published": "2026-08-28T06:00:00+03:00",
+                },
+                {
+                    "source": "ביזפורטל",
+                    "reliability": "financial_press",
+                    "title": "אאורה דיווחה על מכירת דירות",
+                    "published": "2026-08-28T06:00:00+03:00",
+                },
+            ],
+        }
+        protocol = (
+            "CATALYST|נפט וגז|N0|earnings|1|5|10|דלק רכב עלתה\n"
+            "CATALYST|אנרגיה ותשתיות|N1|earnings|1|5|אאורה עלתה"
+        )
+
+        catalysts = financial_brief._parse_news_catalysts(data, protocol)
+
+        self.assertEqual(catalysts["נפט וגז"]["adjustment"], 0)
+        self.assertEqual(catalysts["אנרגיה ותשתיות"]["adjustment"], 0)
 
     def test_delivery_run_reuses_brief_retries_failure_then_skips_duplicate(self):
         fixed_now = datetime(

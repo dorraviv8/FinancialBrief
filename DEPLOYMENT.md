@@ -20,6 +20,7 @@ Set this in the production environment file:
 FINANCIAL_BRIEF_DB_PATH=/var/lib/financialbrief/subscribers.db
 FINANCIAL_BRIEF_CACHE_DIR=/var/lib/financialbrief/market-cache
 BASE_URL=https://trader.34.69.156.167.nip.io/financialbrief
+RECOMMENDATION_V2_MODE=shadow
 ```
 
 The cache refreshes index constituent metadata once daily. It fetches all graph pages only on its first run and weekly
@@ -31,6 +32,13 @@ official sector/TA-125 closes, and their realized 10/20/30-session outcomes.
 The email displays historical results after 20 comparable completed cases and
 permits a bounded calibration adjustment only after 30. Dry runs do not add
 predictions or outcomes.
+
+Recommendation V2 records daily feature snapshots, separate 10/20/30-session
+probability forecasts, chronological walk-forward metrics and realized live
+outcomes. Keep it in `shadow` mode initially. `auto` promotion requires at least
+60 matured 20-session forecasts plus a better probability score and no loss of
+directional accuracy against V1. See `RECOMMENDATION_MODEL.md` for the formula,
+audit trail and activation policy.
 
 It also stores one immutable briefing per Israel calendar date and a delivery
 record for every recipient. Normal reruns reuse the persisted briefing, retry

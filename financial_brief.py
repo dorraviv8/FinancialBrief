@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from difflib import SequenceMatcher
 import fcntl
 import hashlib
 import html
@@ -1770,6 +1771,32 @@ def _apply_quality_replacements(
     return corrected, applied
 
 
+def _quality_repair_candidates(brief_text: str, review: dict) -> list[str]:
+    """Return a small set of exact report lines near rejected reviewer text."""
+    lines = [
+        line.strip()
+        for line in brief_text.splitlines()
+        if line.strip()
+        and not line.startswith("###")
+        and not (line.startswith("|") and line.endswith("|"))
+        and len(line.strip()) <= 600
+    ]
+    requested = [
+        str(item.get("old") or "").strip()
+        for item in review.get("replacements", [])
+        if item.get("old")
+    ]
+    if not requested:
+        return lines[:18]
+    ranked = []
+    for line in lines:
+        score = max(
+            SequenceMatcher(None, old, line).ratio() for old in requested
+        )
+        ranked.append((score, line))
+    return [line for _score, line in sorted(ranked, reverse=True)[:12]]
+
+
 def review_and_correct_brief(
     brief_text: str,
     report_type: str,
@@ -1827,9 +1854,41 @@ def review_and_correct_brief(
             brief_text, review.get("replacements", [])
         )
         if not applied:
-            raise RuntimeError(
-                "Report quality reviewer requested changes but supplied no safe correction"
+            print(
+                "QA requested revision but its first correction was unsafe; "
+                "requesting one constrained repair"
             )
+            repair_prompt = f"""אתה מתקן בדוח עברי רק בעיית ניסוח שכבר זוהתה. התיקון הראשון לא התאים לטקסט המדויק או ניסה לשנות מספר/קישור.
+
+החזר JSON בלבד. אם לאחר בדיקה נוספת אין בעיה מהותית, החזר:
+{{"status":"pass","summary":"הסבר קצר","replacements":[]}}
+
+אחרת החזר תיקון אחד עד שלושה. שדה old חייב להיות העתק מדויק לחלוטין של שורה אחת מרשימת השורות, כולל סימני Markdown. שדה new חייב לשמור ללא שינוי כל מספר, תאריך וקישור:
+{{"status":"revise","summary":"הסבר קצר","replacements":[{{"old":"שורה מדויקת","new":"ניסוח מתוקן","reason":"סיבה"}}]}}
+
+הביקורת הראשונה: {json.dumps(review, ensure_ascii=False, separators=(",", ":"))}
+שורות מדויקות אפשריות מתוך הדוח: {json.dumps(_quality_repair_candidates(brief_text, review), ensure_ascii=False, separators=(",", ":"))}"""
+            repair_raw = _groq_completion(
+                client,
+                GROQ_MODEL,
+                repair_prompt,
+                max_tokens=400,
+                purpose="quality-correction-retry",
+            )
+            repair_review = _parse_quality_response(repair_raw)
+            if repair_review is None:
+                raise RuntimeError(
+                    "Report quality correction retry returned invalid output"
+                )
+            if repair_review["status"] == "revise":
+                corrected, applied = _apply_quality_replacements(
+                    brief_text, repair_review.get("replacements", [])
+                )
+                if not applied:
+                    raise RuntimeError(
+                        "Report quality correction retry supplied no safe correction"
+                    )
+            review = repair_review
     post_issues = _deterministic_quality_issues(
         corrected, report_type, fact_context
     )
@@ -1844,6 +1903,27 @@ def review_and_correct_brief(
         "reviewed_at": _today().isoformat(timespec="seconds"),
         "model": GROQ_MODEL,
     }
+
+
+def send_preparation_failure_alert(error: Exception) -> None:
+    """Notify the owner when the 08:00 safety gate withholds a report."""
+    recipient = OWNER_EMAIL or GMAIL_USER
+    if not recipient or not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        return
+    report_date = _today().strftime("%d/%m/%Y")
+    reason = html.escape(str(error)[:1000])
+    content = (
+        '<div dir="rtl" style="font-family:Arial,sans-serif;text-align:right">'
+        f"<h2>דוח FinancialBrief לא נשלח – {report_date}</h2>"
+        "<p>שלב השליחה בשעה 08:00 לא מצא דוח מאושר להיום. "
+        "המערכת מנעה שליחת דוח לא בדוק.</p>"
+        f"<p><strong>סיבה:</strong> {reason}</p></div>"
+    )
+    send_email(
+        content,
+        f"FinancialBrief: הדוח לא נשלח – {report_date}",
+        recipient,
+    )
 
 
 def _render_inline_markdown(text: str) -> str:
@@ -2440,11 +2520,18 @@ def main() -> None:
             )
     elif args.send_prepared:
         with _delivery_process_lock():
-            result = run(
-                send=True,
-                approved_only=True,
-                force_send=args.force_send,
-            )
+            try:
+                result = run(
+                    send=True,
+                    approved_only=True,
+                    force_send=args.force_send,
+                )
+            except Exception as exc:
+                try:
+                    send_preparation_failure_alert(exc)
+                except Exception as alert_exc:
+                    print(f"Could not send preparation failure alert: {alert_exc}")
+                raise
     else:
         with _delivery_process_lock():
             result = run(

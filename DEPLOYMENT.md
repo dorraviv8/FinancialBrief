@@ -61,6 +61,10 @@ checks, applies only guarded prose corrections, and stores it with
 approved report. It refuses to generate a replacement or send an unapproved
 report. On Sunday the preparation stage automatically creates the weekly summary
 for the preceding Monday–Saturday calendar window, using actual TASE sessions.
+The preparation timer has a 07:55 recovery attempt. A successful first run makes
+that attempt a no-op; a failed first run gets one fresh opportunity before
+delivery. If no approved report exists at 08:00, subscribers receive nothing and
+the owner receives an operational failure notice instead.
 
 Both timers use `Persistent=true`. If a restart causes both missed jobs to run,
 the send service is ordered after preparation and still enforces the approval

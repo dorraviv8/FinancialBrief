@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -844,6 +845,65 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertNotIn("3.50%", corrected)
         self.assertIn("נוסח מחדש", corrected)
         self.assertEqual(len(applied), 1)
+
+    def test_quality_review_retries_an_unsafe_correction_with_exact_text(self):
+        brief = "### בדיקה\nהמשפט הזה אינו ברור לקורא."
+        first_review = json.dumps({
+            "status": "revise",
+            "summary": "נדרש ניסוח ברור",
+            "replacements": [{
+                "old": "משפט שאינו מופיע בדוח.",
+                "new": "ניסוח אחר.",
+                "reason": "בהירות",
+            }],
+        }, ensure_ascii=False)
+        repair_review = json.dumps({
+            "status": "revise",
+            "summary": "תיקון מדויק",
+            "replacements": [{
+                "old": "המשפט הזה אינו ברור לקורא.",
+                "new": "המשפט נוסח מחדש באופן ברור לקורא.",
+                "reason": "בהירות",
+            }],
+        }, ensure_ascii=False)
+
+        with (
+            patch.object(financial_brief, "GROQ_API_KEY", "test-key"),
+            patch.object(financial_brief, "Groq"),
+            patch.object(
+                financial_brief,
+                "_deterministic_quality_issues",
+                return_value=[],
+            ),
+            patch.object(
+                financial_brief,
+                "_groq_completion",
+                side_effect=(first_review, repair_review),
+            ) as completion,
+        ):
+            corrected, qa = financial_brief.review_and_correct_brief(
+                brief, "daily", {}
+            )
+
+        self.assertIn("נוסח מחדש באופן ברור", corrected)
+        self.assertEqual(qa["status"], "approved")
+        self.assertEqual(qa["corrections_applied"], 1)
+        self.assertEqual(completion.call_count, 2)
+
+    def test_missing_approved_report_alerts_only_the_owner(self):
+        with (
+            patch.object(financial_brief, "OWNER_EMAIL", "owner@example.com"),
+            patch.object(financial_brief, "GMAIL_USER", "sender@example.com"),
+            patch.object(financial_brief, "GMAIL_APP_PASSWORD", "secret"),
+            patch.object(financial_brief, "send_email") as send,
+        ):
+            financial_brief.send_preparation_failure_alert(
+                RuntimeError("No approved report")
+            )
+
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2], "owner@example.com")
+        self.assertIn("לא נשלח", send.call_args.args[1])
 
     def test_process_lock_rejects_overlapping_delivery(self):
         with TemporaryDirectory() as directory, patch.dict(

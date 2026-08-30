@@ -1,12 +1,12 @@
 [Unit]
-Description=Prepare and QA Israeli stock-market morning briefing
-After=network-online.target
+Description=Retry preparation and QA of the Israeli market morning briefing
+After=network-online.target financial-brief.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Finish or fail before the separate 07:55 recovery job is due.
-TimeoutStartSec=9min
+# Leave a safety margin before the fixed 08:00 delivery job.
+TimeoutStartSec=4min
 TimeoutStopSec=10s
 User=YOUR_GCP_USER
 WorkingDirectory=/opt/financialbrief
@@ -14,7 +14,6 @@ EnvironmentFile=/etc/financialbrief.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/opt/financialbrief/fin_env/bin/python /opt/financialbrief/financial_brief.py --prepare
 
-# Basic service hardening while retaining network and database access.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

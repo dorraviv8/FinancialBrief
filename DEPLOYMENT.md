@@ -53,7 +53,8 @@ excludes them.
 
 ## Morning schedule
 
-The morning workflow is deliberately split into two services. At 07:45 in the
+The morning workflow is deliberately split into preparation, recovery, and
+delivery services. Every day at 07:45 in the
 `Asia/Jerusalem` timezone, the preparation service gathers fresh data, generates
 the report, reads the completed output through deterministic and AI clarity/fact
 checks, applies only guarded prose corrections, and stores it with
@@ -61,10 +62,12 @@ checks, applies only guarded prose corrections, and stores it with
 approved report. It refuses to generate a replacement or send an unapproved
 report. On Sunday the preparation stage automatically creates the weekly summary
 for the preceding Monday–Saturday calendar window, using actual TASE sessions.
-The preparation timer has a 07:55 recovery attempt. A successful first run makes
-that attempt a no-op; a failed first run gets one fresh opportunity before
-delivery. If no approved report exists at 08:00, subscribers receive nothing and
-the owner receives an operational failure notice instead.
+The primary preparation job has a nine-minute deadline, so it cannot block the
+separate 07:55 recovery service. A successful first run makes recovery a fast
+no-op that reuses the approved report; a failed first run gets one fresh,
+four-minute opportunity and must finish before delivery. If no approved report
+exists at 08:00, subscribers receive nothing and the owner receives an
+operational failure notice instead.
 
 Both timers use `Persistent=true`. If a restart causes both missed jobs to run,
 the send service is ordered after preparation and still enforces the approval
@@ -84,6 +87,8 @@ private Docker gateway (`172.18.0.1:5001`) and Caddy publishes the app below
 ```bash
 sudo cp deploy/financial-brief.service /etc/systemd/system/
 sudo cp deploy/financial-brief.timer /etc/systemd/system/
+sudo cp deploy/financial-brief-retry.service /etc/systemd/system/
+sudo cp deploy/financial-brief-retry.timer /etc/systemd/system/
 sudo cp deploy/financial-brief-send.service /etc/systemd/system/
 sudo cp deploy/financial-brief-send.timer /etc/systemd/system/
 sudo cp deploy/financial-brief-sources.service /etc/systemd/system/
@@ -92,6 +97,7 @@ sudo cp deploy/financial-brief-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now financial-brief-web.service
 sudo systemctl enable --now financial-brief.timer
+sudo systemctl enable --now financial-brief-retry.timer
 sudo systemctl enable --now financial-brief-send.timer
 sudo systemctl enable --now financial-brief-sources.timer
 ```
@@ -99,8 +105,8 @@ sudo systemctl enable --now financial-brief-sources.timer
 Check scheduling and logs:
 
 ```bash
-systemctl list-timers financial-brief.timer financial-brief-send.timer financial-brief-sources.timer
-journalctl -u financial-brief.service -n 100 --no-pager
+systemctl list-timers financial-brief.timer financial-brief-retry.timer financial-brief-send.timer financial-brief-sources.timer
+journalctl -u financial-brief.service -u financial-brief-retry.service -n 100 --no-pager
 ```
 
 ## Safe validation order

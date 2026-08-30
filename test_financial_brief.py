@@ -918,5 +918,26 @@ class IsraelMarketTests(unittest.TestCase):
                         pass
 
 
+class DeploymentScheduleTests(unittest.TestCase):
+    def test_morning_pipeline_has_bounded_separate_recovery_before_delivery(self):
+        deploy_dir = Path(__file__).resolve().parent / "deploy"
+        primary_timer = (deploy_dir / "financial-brief.timer").read_text()
+        primary_service = (deploy_dir / "financial-brief.service").read_text()
+        retry_timer = (deploy_dir / "financial-brief-retry.timer").read_text()
+        retry_service = (deploy_dir / "financial-brief-retry.service").read_text()
+        send_timer = (deploy_dir / "financial-brief-send.timer").read_text()
+        send_service = (deploy_dir / "financial-brief-send.service").read_text()
+
+        self.assertIn("07:45:00 Asia/Jerusalem", primary_timer)
+        self.assertNotIn("07:55:00", primary_timer)
+        self.assertIn("TimeoutStartSec=9min", primary_service)
+        self.assertIn("07:55:00 Asia/Jerusalem", retry_timer)
+        self.assertIn("TimeoutStartSec=4min", retry_service)
+        self.assertIn("--prepare", retry_service)
+        self.assertIn("08:00:00 Asia/Jerusalem", send_timer)
+        self.assertIn("financial-brief-retry.service", send_service)
+        self.assertIn("--send-prepared", send_service)
+
+
 if __name__ == "__main__":
     unittest.main()

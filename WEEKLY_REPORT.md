@@ -2,7 +2,8 @@
 
 Every Sunday, the 07:45 preparation path automatically generates and QA-approves
 a weekly Israeli-market report instead of the daily report. The approved report
-is sent at 08:00. Weekday behavior is unchanged.
+is sent at 08:00. The same prepare, review, 07:55 recovery, and 08:00 delivery
+workflow runs for daily reports on every other day.
 
 ## Calculation rules
 

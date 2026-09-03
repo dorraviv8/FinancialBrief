@@ -561,6 +561,15 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertIn('href="https://example.com"', rendered)
         self.assertNotIn("<script>bad()", rendered)
 
+    def test_html_email_uses_enlarged_reader_typography(self):
+        rendered = financial_brief.build_html_email("### בדיקה\nתוכן הדוח")
+
+        self.assertIn("h1 { color:#f0c040; font-size:30px;", rendered)
+        self.assertIn(".card-title { color:#163e70; font-size:19px;", rendered)
+        self.assertIn(".card-body { color:#2c3e52; font-size:16.5px;", rendered)
+        self.assertIn("font-size:14px; line-height:1.7;", rendered)
+        self.assertIn("font-size:13px; padding:18px;", rendered)
+
     def test_html_email_is_rtl_splits_indices_and_removes_profile_preamble(self):
         brief = """פרופיל משקיע: מאוזן
 ### מדד ת״א-35

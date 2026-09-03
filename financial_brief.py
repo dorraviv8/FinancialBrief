@@ -2074,14 +2074,14 @@ def build_html_email(
     body {{ font-family:Arial,"Noto Sans Hebrew",sans-serif; background:#e8edf4; color:#1e2d42; direction:rtl; text-align:right; }}
     .wrapper {{ max-width:720px; margin:0 auto; padding:24px 16px 40px; }}
     .header {{ background:linear-gradient(135deg,#123767,#1f5797); border-radius:16px; padding:34px; text-align:center; }}
-    .logo {{ color:#9ec3e8; font-size:10px; letter-spacing:3px; margin-bottom:10px; }}
-    h1 {{ color:#f0c040; font-size:28px; margin-bottom:8px; }}
-    .date {{ color:#c1d8ef; font-size:14px; }}
+    .logo {{ color:#9ec3e8; font-size:12px; letter-spacing:3px; margin-bottom:10px; }}
+    h1 {{ color:#f0c040; font-size:30px; margin-bottom:8px; }}
+    .date {{ color:#c1d8ef; font-size:16px; }}
     .accent {{ height:3px; margin:18px 40px; background:linear-gradient(90deg,transparent,#f0c040,#e08030,#f0c040,transparent); }}
     .card {{ background:#f7faff; border:1px solid #c8d8ea; border-radius:14px; padding:22px 26px; margin-bottom:14px; box-shadow:0 2px 10px rgba(30,60,100,.08); }}
     .index-card {{ border-right:5px solid #1f5797; }}
-    .card-title {{ color:#163e70; font-size:17px; font-weight:700; border-bottom:2px solid #dce8f4; padding-bottom:10px; margin-bottom:14px; }}
-    .card-body {{ color:#2c3e52; font-size:14.5px; line-height:1.9; direction:rtl; text-align:right; unicode-bidi:plaintext; }}
+    .card-title {{ color:#163e70; font-size:19px; font-weight:700; border-bottom:2px solid #dce8f4; padding-bottom:10px; margin-bottom:14px; }}
+    .card-body {{ color:#2c3e52; font-size:16.5px; line-height:1.9; direction:rtl; text-align:right; unicode-bidi:plaintext; }}
     .card-body p {{ margin:0 0 12px; direction:rtl; text-align:right; }}
     .card-body ul,.card-body ol {{ margin:0 0 14px; padding:0 22px 0 0; direction:rtl; text-align:right; }}
     .card-body li {{ margin-bottom:7px; padding-right:2px; direction:rtl; text-align:right; }}
@@ -2091,8 +2091,8 @@ def build_html_email(
     th {{ background:#e5eef8; color:#163e70; font-weight:700; }}
     th,td {{ border:1px solid #c8d8ea; padding:8px 9px; vertical-align:top; direction:rtl; text-align:right; unicode-bidi:plaintext; }}
     strong {{ color:#0f2d5e; }}
-    .notice {{ background:#fff8df; border:1px solid #ead58b; color:#66551c; border-radius:10px; padding:13px 16px; margin-top:16px; font-size:12px; line-height:1.7; }}
-    .footer {{ text-align:center; color:#71869d; font-size:11px; padding:18px; line-height:1.8; }}
+    .notice {{ background:#fff8df; border:1px solid #ead58b; color:#66551c; border-radius:10px; padding:13px 16px; margin-top:16px; font-size:14px; line-height:1.7; }}
+    .footer {{ text-align:center; color:#71869d; font-size:13px; padding:18px; line-height:1.8; }}
   </style>
 </head>
 <body dir="rtl" align="right"><div class="wrapper" dir="rtl" align="right">

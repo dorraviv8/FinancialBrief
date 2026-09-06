@@ -27,6 +27,17 @@ MATERIAL_TERMS = (
     "דוחות", "רווח", "הפסד", "תחזית", "עסקה", "מיזוג", "הנפק", "גז",
 )
 
+ADMINISTRATIVE_TERMS = (
+    "מצבת הון", "מצבת החזקות", "שינוי בהון", "דוח הצעת מדף",
+    "פדיון מוקדם", "תוצאות הנפקה", "מועד תשלום", "זימון אסיפה",
+)
+
+MARKET_SCOPE_TERMS = (
+    "בורסה", "שוק ההון", "תא 35", "תא 90", "תא 125", "מדד",
+    "ריבית", "אינפלציה", "שקל", "דולר", "אירו שקל", "דירוג", "תקציב",
+    "בנק ישראל", "משקיעים מוסדיים",
+)
+
 _MAGNITUDE_PATTERNS = {
     "thousand": re.compile(
         r"(?:(?<=\d)k\b|\bthousand(?:s)?\b|אל(?:ף|פים))",
@@ -299,18 +310,47 @@ def compact_weekly_ai_payload(
     }
 
 
+def _news_editorial_score(item: dict) -> tuple[int, str]:
+    text = _normalized(f"{item.get('title')} {item.get('summary')}")
+    materiality = sum(term in text for term in MATERIAL_TERMS)
+    market_scope = sum(term in text for term in MARKET_SCOPE_TERMS)
+    administrative = sum(term in text for term in ADMINISTRATIVE_TERMS)
+    official = 2 if item.get("reliability") == "official" else 0
+    has_context = 1 if len(str(item.get("summary") or "").strip()) >= 80 else 0
+    return (
+        market_scope * 4 + materiality * 3 + official + has_context
+        - administrative * 6,
+        str(item.get("published") or ""),
+    )
+
+
+def _is_routine_market_recap(item: dict) -> bool:
+    """Exclude daily closing recaps unless they contain a material catalyst."""
+    text = _normalized(f"{item.get('title')} {item.get('summary')}")
+    recap_terms = ("נעילה", "סגירה", "סגר", "עלה", "ירד")
+    catalyst_terms = (
+        "ריבית", "אינפלציה", "דירוג", "מלחמה", "הסכם", "רגול",
+        "תקציב", "דוחות", "תחזית", "עסקה", "מיזוג", "גז",
+    )
+    return any(term in text for term in recap_terms) and not any(
+        term in text for term in catalyst_terms
+    )
+
+
 def _ai_news_candidates(news_items: list[dict], maximum: int = 24) -> list[dict]:
     """Keep the AI request bounded while preserving source diversity."""
+    eligible = [
+        item for item in news_items
+        if not _is_routine_market_recap(item)
+        if not any(
+            term in _normalized(f"{item.get('title')} {item.get('summary')}")
+            for term in ADMINISTRATIVE_TERMS
+        )
+    ]
+
     ranked = sorted(
-        news_items,
-        key=lambda item: (
-            1 if item.get("reliability") == "official" else 0,
-            sum(
-                term in _normalized(f"{item.get('title')} {item.get('summary')}")
-                for term in MATERIAL_TERMS
-            ),
-            str(item.get("published") or ""),
-        ),
+        eligible,
+        key=_news_editorial_score,
         reverse=True,
     )
     selected = []
@@ -337,26 +377,38 @@ def weekly_ai_prompt(snapshot: dict, fx_rates: dict, news_items: list[dict]) -> 
     sector_names = ", ".join(snapshot.get("sectors", {}))
     return f"""אתה עורך שבועי של שוק ההון הישראלי. השתמש רק בנתונים ובכתבות שסופקו. כתוב עברית תקנית, בהירה וקצרה לקורא שאינו מכיר מונחים טכניים.
 
-בחר עד שש כתבות שהיו המהותיות והמשפיעות ביותר למשקיעים במהלך השבוע. העדף מקור רשמי, אירוע בעל השפעה רחבה, דוחות/תחזיות/רגולציה ואירוע שמסביר תנועה במדד או בסקטור. אל תמציא עובדות מעבר לכותרת ולתקציר. לכל סקטור מותר לשייך לכל היותר כתבה אחת ורק אם הקשר ישיר.
+בחר עד ארבע כתבות שהיו המהותיות והמשפיעות ביותר למשקיעים במהלך השבוע; מותר לבחור פחות אם אין ארבע כתבות ראויות. סדר אותן מהאירוע בעל ההשפעה הרחבה ביותר על השוק ועד לאירוע הממוקד ביותר. העדף מקור רשמי, אירוע בעל השפעה רחבה, דוחות/תחזיות/רגולציה ואירוע שמסביר תנועה במדד או בסקטור. אירוע הנוגע לחברה יחידה ייכלל רק אם הוא מהותי לסקטור או לחברה גדולה במדד מרכזי. אל תבחר כמה כתבות שמתארות את אותו אירוע. אל תמציא עובדות מעבר לכותרת, לתקציר ולנתוני השוק שסופקו. לכל סקטור מותר לשייך לכל היותר כתבה אחת ורק אם הקשר ישיר.
+
+לכל כתבה כתוב שני משפטים נפרדים: סיכום עובדתי שמסביר מה קרה, ולאחריו הסבר פשוט מדוע האירוע חשוב למשקיעים ובאיזה מנגנון הוא עשוי להשפיע על השוק, המדד או הסקטור. משפט ההשפעה אינו סיכום נוסף של ביצועי המדד ואינו תחזית מחיר. השתמש בניסוח זהיר כגון "תמך", "הכביד" או "עשוי להשפיע"; אל תציג קשר סיבתי ודאי אם הנתונים אינם מוכיחים אותו. אל תשייך אירוע לסקטור שאינו מוזכר במקור ואין אליו קשר ישיר. אל תכנה מכירת מניות "מחיקה", אל תכתוב "ירידה בתשואת מניות" כאשר המקור מתאר ירידה במחיר המניה, אל תסיק מאירוע יחיד שקיימת "מגמת צמיחה", אל תחזור על כותרת הכתבה ואל תכתוב המלצת קנייה.
+
+דוגמאות לכללי השפעה: בהפחתת ריבית הסבר שעלויות מימון נמוכות יותר עשויות לתמוך בחברות ממונפות; במכירת מניות בידי בעל שליטה הסבר שהיצע מניות גדול יותר עשוי ליצור לחץ קצר טווח על המניה, אך אל תשליך אוטומטית על כל הסקטור; בגיוסים לקרנות הסבר שהם משקפים ביקוש למוצרי השקעה ועשויים להועיל לבתי השקעות, אך אינם בהכרח מגדילים את נזילות הבורסה.
 
 כללי תרגום מחייבים: העתק במדויק כל מספר, אחוז, שנה, מטבע ויחידת גודל מהמקור. million, mn, m או מ׳ פירושם מיליון; billion או bn פירושם מיליארד. אסור להחליף מיליון במיליארד או להפך. אין לתרגם או לשנות שם חברה, סימול, שם מוצר או שם אדם. אם פרט באנגלית אינו חד-משמעי, השמט אותו במקום לנחש.
 
-החזר אך ורק שורות במבנה הבא, בלי Markdown:
-NEWS|Wמספר|סיכום עובדתי וברור של משפט אחד
+החזר אך ורק שורות במבנה הבא, בלי Markdown. אין להשתמש בתו | בתוך הטקסט החופשי:
+NEWS|Wמספר|סיכום עובדתי וברור של משפט אחד|השפעה אפשרית על השוק במשפט אחד ובשפה פשוטה
 SECTOR|שם סקטור|Wמספר או NONE|כיוון -1/0/1|מהותיות 0-5|משך צפוי בימים 1-30|גורם מרכזי במשפט קצר, או NONE אם אין קשר חדשותי ישיר
 
 כתוב שורת SECTOR אחת לכל אחד מעשרת הסקטורים האלה: {sector_names}.
 נתונים: {payload}"""
 
 
-def _fallback_news(news_items: list[dict], maximum: int = 6) -> list[dict]:
+def _fallback_news(news_items: list[dict], maximum: int = 4) -> list[dict]:
     def score(item: dict) -> tuple[int, str]:
         text = _normalized(f"{item.get('title')} {item.get('summary')}")
         materiality = sum(term in text for term in MATERIAL_TERMS)
         official = 3 if item.get("reliability") == "official" else 0
         return official + materiality, str(item.get("published") or "")
 
-    ranked = sorted(news_items, key=score, reverse=True)
+    eligible = [
+        item for item in news_items
+        if not _is_routine_market_recap(item)
+        if not any(
+            term in _normalized(f"{item.get('title')} {item.get('summary')}")
+            for term in ADMINISTRATIVE_TERMS
+        )
+    ]
+    ranked = sorted(eligible, key=score, reverse=True)
     selected = []
     source_counts = {}
     for item in ranked:
@@ -370,6 +422,24 @@ def _fallback_news(news_items: list[dict], maximum: int = 6) -> list[dict]:
     return selected
 
 
+def _fallback_market_impact(data: dict, item: dict) -> str:
+    """Provide a cautious impact note when the model output is missing or unsafe."""
+    text = _normalized(f"{item.get('title')} {item.get('summary')}")
+    if "ריבית" in text:
+        return "האירוע עשוי להשפיע על השוק דרך עלויות המימון, שווי החברות והביקוש לנכסי סיכון."
+    if "אינפלציה" in text:
+        return "האירוע עשוי להשפיע על ציפיות הריבית, על שער השקל ועל התמחור של מניות ואג״ח."
+    if "דירוג" in text:
+        return "האירוע עשוי להשפיע על עלויות המימון של המשק ועל רמת הסיכון שהמשקיעים מייחסים לנכסים בישראל."
+    related = [
+        name for name in data.get("sectors", {})
+        if _news_relevant_to_sector(data, name, item)
+    ]
+    if related:
+        return f"ההשפעה הישירה צפויה להתמקד בסקטור {related[0]}, בהתאם להיקף האירוע ולתגובת המשקיעים."
+    return "ההשפעה הישירה צפויה להתמקד בחברה ובענף שלה; השפעה רחבה על השוק תלויה בהיקף האירוע."
+
+
 def parse_weekly_ai_response(
     data: dict,
     snapshot: dict,
@@ -377,19 +447,23 @@ def parse_weekly_ai_response(
     response: str,
 ) -> dict:
     by_protocol_id = {f"W{item['id']}": item for item in news_items}
+    candidate_ids = {
+        f"W{item['id']}" for item in _ai_news_candidates(news_items)
+    }
     selected = []
     summaries = {}
+    market_impacts = {}
     factors = {}
     outlook = []
     translation_fallbacks = []
     for raw_line in (response or "").splitlines():
         line = raw_line.strip()
         if line.startswith("NEWS|"):
-            parts = line.split("|", 2)
-            if len(parts) != 3 or parts[1] not in by_protocol_id:
+            parts = line.split("|", 3)
+            if len(parts) not in {3, 4} or parts[1] not in candidate_ids:
                 continue
             item_id = parts[1]
-            if item_id not in selected and len(selected) < 6:
+            if item_id not in selected and len(selected) < 4:
                 selected.append(item_id)
                 summary = clean_ai_text(parts[2])[:360]
                 item = by_protocol_id[item_id]
@@ -399,6 +473,16 @@ def parse_weekly_ai_response(
                 else:
                     summaries[item_id] = _safe_source_summary(item)
                     translation_fallbacks.append(item_id)
+                impact = clean_ai_text(parts[3])[:360] if len(parts) == 4 else ""
+                impact_context = source_text + " " + json.dumps(
+                    snapshot, ensure_ascii=False, separators=(",", ":")
+                )
+                if impact and translation_preserves_source_facts(
+                    impact_context, impact
+                ):
+                    market_impacts[item_id] = impact
+                else:
+                    market_impacts[item_id] = _fallback_market_impact(data, item)
         elif line.startswith("SECTOR|"):
             parts = line.split("|", 6)
             if len(parts) not in {4, 7} or parts[1] not in snapshot.get("sectors", {}):
@@ -422,6 +506,7 @@ def parse_weekly_ai_response(
                 continue
             if (
                 item
+                and reason.upper() != "NONE"
                 and _news_relevant_to_sector(data, sector_name, item)
                 and translation_preserves_source_facts(source_text, reason)
             ):
@@ -445,9 +530,14 @@ def parse_weekly_ai_response(
     if not selected:
         selected_items = _fallback_news(news_items)
         selected = [f"W{item['id']}" for item in selected_items]
+    selected.sort(
+        key=lambda item_id: _news_editorial_score(by_protocol_id[item_id]),
+        reverse=True,
+    )
     selected_items = [by_protocol_id[item_id] for item_id in selected]
     for item_id, item in zip(selected, selected_items):
         summaries.setdefault(item_id, str(item.get("title") or ""))
+        market_impacts.setdefault(item_id, _fallback_market_impact(data, item))
 
     if len(outlook) < 3:
         ta125 = snapshot.get("indices", {}).get("ת״א-125", {})
@@ -468,6 +558,9 @@ def parse_weekly_ai_response(
             {
                 **item,
                 "ai_summary": summaries.get(f"W{item['id']}", item.get("title")),
+                "market_impact": market_impacts.get(
+                    f"W{item['id']}", _fallback_market_impact(data, item)
+                ),
                 "translation_fallback": f"W{item['id']}" in translation_fallbacks,
             }
             for item in selected_items
@@ -501,6 +594,11 @@ def _format_pct(value) -> str:
 
 def _published_date(value) -> str:
     if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.strftime("%d/%m/%Y")
+    except (TypeError, ValueError):
         return ""
 
 
@@ -668,13 +766,6 @@ def build_plain_language_weekly_outlook(snapshot: dict, fx_rates: dict) -> str:
         f"- **מה עשוי לתמוך בשוק:** {support}",
         f"- **מה עלול להכביד:** {risk}",
     ))
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return parsed.strftime("%d/%m/%Y")
-    except (TypeError, ValueError):
-        return ""
-
-
 def build_weekly_brief(
     data: dict,
     snapshot: dict,
@@ -694,19 +785,20 @@ def build_weekly_brief(
     news_lines = [
         f"- **תקופת הסיכום:** {start_label}–{end_label}. נבחרו רק אירועים בעלי חשיבות למשקיעים."
     ]
-    for item in analysis.get("selected_news", []):
+    for position, item in enumerate(analysis.get("selected_news", []), 1):
         source = item.get("source") or "מקור לא ידוע"
         link = item.get("link")
-        title = item.get("title") or "כתבה"
-        linked_title = f"[{title}]({link})" if link else title
+        source_link = f"[למקור המלא – {source}]({link})" if link else source
         published = _published_date(item.get("published"))
-        date_note = f", {published}" if published else ""
-        if item.get("translation_fallback"):
-            news_lines.append(f"- **{source}{date_note}:** {linked_title}")
-        else:
-            news_lines.append(
-                f"- **{source}{date_note}:** {item.get('ai_summary')} ({linked_title})"
-            )
+        date_note = f" · {published}" if published else ""
+        summary = item.get("ai_summary") or _safe_source_summary(item)
+        impact = item.get("market_impact") or _fallback_market_impact(data, item)
+        news_lines.extend((
+            f"#### אירוע {position}{date_note}",
+            f"- **מה קרה:** {summary}",
+            f"- **השפעה על השוק:** {impact}",
+            f"- {source_link}",
+        ))
     if len(news_lines) == 1:
         news_lines.append("- לא נשמרו השבוע חדשות מהותיות בעלות מקור וקישור תקינים.")
     sections.append("### החדשות המרכזיות של השבוע\n" + "\n".join(news_lines))

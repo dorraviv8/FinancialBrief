@@ -1869,6 +1869,17 @@ def generate_weekly_hebrew_brief(
             for item in analysis.get("selected_news", [])
             if int(item["id"]) < 900_000
         ],
+        "selected_news": [
+            {
+                "source": item.get("source"),
+                "title": item.get("title"),
+                "source_summary": str(item.get("summary") or "")[:500],
+                "report_summary": item.get("ai_summary"),
+                "report_market_impact": item.get("market_impact"),
+                "published": item.get("published"),
+            }
+            for item in analysis.get("selected_news", [])
+        ],
         "translation_fallbacks": len(analysis.get("translation_fallbacks", [])),
         "active_recommendation_model": model_status.get("active_model", "v1"),
     }
@@ -1910,6 +1921,11 @@ def _deterministic_quality_issues(
         )
         if "אין עדיין מספיק תצפיות שבועיות" in brief_text:
             issues.append("weekly FX calculation is incomplete")
+        if (
+            "לא נשמרו השבוע חדשות מהותיות" not in brief_text
+            and "**השפעה על השוק:**" not in brief_text
+        ):
+            issues.append("weekly news items are missing market-impact explanations")
         snapshot = context.get("weekly_snapshot", {})
         for key in ("window_start", "window_end"):
             value = snapshot.get(key)
@@ -2035,7 +2051,7 @@ def review_and_correct_brief(
 
     prompt = f"""אתה עורך בקרה אחרון לדוח שוק ההון הישראלי. קרא את הדוח המלא ובדוק עברית, בהירות לקורא ללא ידע טכני, סתירות פנימיות וטענות שאינן נתמכות בהקשר העובדתי. המספרים, התאריכים, הטבלאות והקישורים חושבו מקומית: אין לשנות אותם. אין להוסיף מידע חיצוני, תחזית חדשה או המלצת קנייה.
 
-בדוק במיוחד תרגום מאנגלית לעברית: כל מספר, אחוז, שנה, מטבע ויחידת גודל חייבים לשמור בדיוק על משמעות המקור. million, mn, m או מ׳ הם מיליון; billion או bn הם מיליארד. אסור להחליף מיליון במיליארד, לשנות שם חברה/אדם/מוצר או להרחיב קיצור באמצעות ניחוש. במקרה של ספק יש לנסח בלי הפרט הלא-ודאי.
+בדוק במיוחד תרגום וסיכום מאנגלית או מעברית לעברית: כל מספר, אחוז, שנה, מטבע ויחידת גודל חייבים לשמור בדיוק על משמעות המקור. million, mn, m או מ׳ הם מיליון; billion או bn הם מיליארד. אסור להחליף מיליון במיליארד, לשנות שם חברה/אדם/מוצר, להרחיב קיצור באמצעות ניחוש או לשנות את הפעולה שתוארה במקור — למשל מכירה אינה מחיקה ורכישה אינה הנפקה. ירידה במחיר מניה אינה "ירידה בתשואת המניה" אלא אם המקור עסק במפורש בתשואה. ודא שהסבר ההשפעה על השוק מנוסח בזהירות ואינו הופך אפשרות לעובדה. במקרה של ספק יש לנסח בלי הפרט הלא-ודאי.
 
 אם הדוח ברור ונתמך, החזר JSON בלבד:
 {{"status":"pass","summary":"הסבר קצר","replacements":[]}}
@@ -2498,14 +2514,7 @@ def run(
             quality_context = {
                 "weekly_snapshot": weekly_snapshot,
                 "fx_rates": fx_rates,
-                "news": [
-                    {
-                        "source": item.get("source"),
-                        "title": item.get("title"),
-                        "published": item.get("published"),
-                    }
-                    for item in news_items[:24]
-                ],
+                "selected_news": report_metadata.get("selected_news", []),
                 "weekly_opportunity_scores": {
                     name: {
                         "score": score.get("final_score"),

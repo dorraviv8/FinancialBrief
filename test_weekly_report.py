@@ -64,6 +64,57 @@ class WeeklyReportTests(unittest.TestCase):
             )
         )
 
+    def test_weekly_news_parses_summary_and_market_impact(self):
+        data = {"sectors": {"בנקים": {}}}
+        snapshot = {"indices": {}, "sectors": {"בנקים": {}}}
+        news = [{
+            "id": 8,
+            "source": "בנק ישראל",
+            "reliability": "official",
+            "title": "בנק ישראל הודיע על שינוי בריבית",
+            "summary": "",
+            "companies": [],
+        }]
+
+        parsed = weekly_report.parse_weekly_ai_response(
+            data,
+            snapshot,
+            news,
+            "NEWS|W8|בנק ישראל הודיע על שינוי בריבית.|המהלך עשוי להשפיע על עלויות המימון ועל מניות הבנקים.",
+        )
+
+        self.assertEqual(
+            parsed["selected_news"][0]["ai_summary"],
+            "בנק ישראל הודיע על שינוי בריבית.",
+        )
+        self.assertIn("עלויות המימון", parsed["selected_news"][0]["market_impact"])
+
+    def test_weekly_candidates_exclude_routine_close_and_admin_notice(self):
+        candidates = weekly_report._ai_news_candidates([
+            {
+                "id": 1,
+                "title": "נעילה חיובית: ת״א-35 עלה והביטוח ירד",
+                "summary": "",
+                "source": "עיתון",
+            },
+            {
+                "id": 2,
+                "title": "דוח הצעת מדף ומועד תשלום",
+                "summary": "",
+                "source": "מאיה",
+                "reliability": "official",
+            },
+            {
+                "id": 3,
+                "title": "הפחתת הריבית הוזילה את עלויות המימון בענף הנדל״ן",
+                "summary": "",
+                "source": "בנק ישראל",
+                "reliability": "official",
+            },
+        ])
+
+        self.assertEqual([item["id"] for item in candidates], [3])
+
     def test_shortened_week_uses_previous_close_and_actual_sessions(self):
         metric = weekly_report.weekly_performance(
             [
@@ -184,6 +235,10 @@ class WeeklyReportTests(unittest.TestCase):
         for name in sector_names:
             self.assertIn(f"**{name}:", brief)
         self.assertIn("### מבט לשבוע הבא", brief)
+        self.assertIn("- **מה קרה:**", brief)
+        self.assertIn("**השפעה על השוק:**", brief)
+        self.assertIn("[למקור המלא – בנק ישראל]", brief)
+        self.assertIn("אירוע 1 · 25/08/2026", brief)
         self.assertNotIn("בסיס|", brief)
 
 

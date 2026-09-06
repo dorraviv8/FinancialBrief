@@ -62,6 +62,13 @@ checks, applies only guarded prose corrections, and stores it with
 approved report. It refuses to generate a replacement or send an unapproved
 report. On Sunday the preparation stage automatically creates the weekly summary
 for the preceding Monday–Saturday calendar window, using actual TASE sessions.
+News translation is checked deterministically for number, currency and magnitude
+fidelity before final QA. Rate-limited AI requests use short bounded retries;
+daily outlook wording is composed locally, reducing the daily AI request count.
+Both daily and weekly emails start with one `Market in 60 Seconds` card. The
+legacy market snapshot, score-change summary and separate sector-outlook summary
+are not rendered, because their evidence already appears in the index, ranking
+and sector cards.
 The primary preparation job has a nine-minute deadline, so it cannot block the
 separate 07:55 recovery service. A successful first run makes recovery a fast
 no-op that reuses the approved report; a failed first run gets one fresh,

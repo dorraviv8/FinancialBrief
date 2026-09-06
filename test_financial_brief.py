@@ -3,7 +3,8 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import financial_brief
 import israel_market
@@ -491,6 +492,30 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertIn("לא נרשמה תנועה יומית של 0.5%", card)
         self.assertNotIn("USD/ILS +0.10%", card)
 
+    def test_plain_language_outlook_is_deterministic_and_has_no_raw_booleans(self):
+        outlook = financial_brief.build_plain_language_market_outlook({
+            "indices": {
+                "ת״א-125": {
+                    "breadth": {"advancers": 70, "decliners": 50},
+                    "trend": {
+                        "directional_bias": "חיובית",
+                        "support_60d": 3900,
+                        "resistance_60d": 4300,
+                        "rsi_14": 75,
+                        "return_3m_pct": 4.2,
+                        "above_sma_20": True,
+                        "above_sma_50": True,
+                        "above_sma_200": False,
+                    },
+                }
+            }
+        })
+
+        self.assertIn("### מבט להמשך", outlook)
+        self.assertIn("אזור התמיכה 3,900.00", outlook)
+        self.assertIn("ייתכן מימוש זמני", outlook)
+        self.assertNotRegex(outlook, r"\b(?:true|false)\b")
+
     def test_source_context_cards_include_official_and_press_sources(self):
         cards = financial_brief.build_source_context_cards({
             "exchange_rates": {
@@ -520,35 +545,55 @@ class IsraelMarketTests(unittest.TestCase):
                 ("סקטורים בולטים ותובנות AI", "מבט סקטוריאלי להמשך"),
             )
 
+    def test_ai_request_waits_and_retries_a_rate_limit(self):
+        rate_error = RuntimeError("rate limited")
+        rate_error.status_code = 429
+        rate_error.response = SimpleNamespace(headers={"retry-after": "0.2"})
+        response = SimpleNamespace(
+            usage=None,
+            choices=[SimpleNamespace(message=SimpleNamespace(content="תקין"))],
+        )
+        create = SimpleNamespace(create=Mock(side_effect=[rate_error, response]))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=create))
+
+        with patch.object(financial_brief.time, "sleep") as sleep:
+            result = financial_brief._groq_completion(
+                client, "model", "prompt", 100, "qa-test"
+            )
+
+        self.assertEqual(result, "תקין")
+        self.assertEqual(create.create.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+
     @patch.object(financial_brief, "GROQ_API_KEY", "test-key")
     @patch("financial_brief._groq_completion")
     @patch("financial_brief.Groq")
-    def test_ai_generation_uses_exactly_two_bounded_requests(
+    def test_ai_generation_uses_one_bounded_event_request(
         self, mock_groq, mock_completion
     ):
-        mock_completion.side_effect = [
-            "### תמונת מצב בבורסה בתל אביב\nמצב\n### מבט להמשך\nתחזית",
-            "### סקטורים בולטים ותובנות AI\nתובנה\n### מבט סקטוריאלי להמשך\nתחזית",
-        ]
+        mock_completion.return_value = "\n".join(
+            f"CATALYST|{name}|NONE|none|0|0|1|לא זוהה אירוע"
+            for name in financial_brief.SECTOR_NEWS_KEYWORDS
+        )
 
         brief = financial_brief.generate_hebrew_brief({"indices": {}, "sectors": {}})
 
-        self.assertEqual(mock_completion.call_count, 2)
-        self.assertEqual(mock_completion.call_args_list[0].kwargs["max_tokens"], 1200)
-        self.assertEqual(mock_completion.call_args_list[1].kwargs["max_tokens"], 700)
-        market_prompt = mock_completion.call_args_list[0].args[2]
-        sector_prompt = mock_completion.call_args_list[1].args[2]
-        self.assertIn("הכיוון הסביר", market_prompt)
-        self.assertIn("מתי נשנה את ההערכה", market_prompt)
-        self.assertIn("אסור להשתמש בלי הסבר", market_prompt)
+        self.assertEqual(mock_completion.call_count, 1)
+        self.assertEqual(mock_completion.call_args.kwargs["max_tokens"], 700)
+        sector_prompt = mock_completion.call_args.args[2]
         self.assertIn("CATALYST|שם הסקטור", sector_prompt)
         self.assertIn("מזהה חדשות", sector_prompt)
         self.assertIn("עד 5± נקודות", sector_prompt)
         self.assertIn("אסור לך לבחור ציון", sector_prompt)
         self.assertLess(
-            brief.index("### מה השתנה ומה חשוב הבוקר"),
+            brief.index("### השוק ב-60 שניות"),
             brief.index("### דירוג כל הסקטורים"),
         )
+        self.assertNotIn("### תמונת מצב בבורסה בתל אביב", brief)
+        self.assertNotIn("### מה השתנה ומה חשוב הבוקר", brief)
+        self.assertNotIn("### סקטורים בולטים ותובנות AI", brief)
+        self.assertNotIn("### מבט סקטוריאלי להמשך", brief)
+        self.assertIn("### מבט להמשך", brief)
         mock_groq.return_value.models.list.assert_not_called()
 
     def test_html_email_escapes_ai_html_and_renders_markdown_links(self):
@@ -650,6 +695,39 @@ class IsraelMarketTests(unittest.TestCase):
 
         self.assertEqual(catalysts["נפט וגז"]["adjustment"], 0)
         self.assertEqual(catalysts["אנרגיה ותשתיות"]["adjustment"], 0)
+
+    def test_news_catalyst_falls_back_when_translation_changes_million_to_billion(self):
+        fixed_now = datetime(
+            2026, 9, 6, 7, 45, tzinfo=financial_brief.ISRAEL_TZ
+        )
+        data = {
+            "sectors": {
+                "טכנולוגיה": {
+                    "top_stocks_by_market_cap": [
+                        {"name": "OPTICAL", "symbol": "OPT"}
+                    ]
+                }
+            },
+            "maya_announcements": [{
+                "source": "מאיה",
+                "reliability": "official",
+                "title": "OPTICAL supply agreement worth $4.6m through 2027",
+                "companies": ["OPTICAL"],
+                "published": "2026-09-06T06:00:00+03:00",
+            }],
+            "news": [],
+        }
+        protocol = (
+            "CATALYST|טכנולוגיה|M0|corporate|1|4|14|"
+            "OPTICAL חתמה על הסכם בשווי 4.6 מיליארד דולר עד 2027"
+        )
+
+        with patch.object(financial_brief, "_today", return_value=fixed_now):
+            result = financial_brief._parse_news_catalysts(data, protocol)
+
+        self.assertIn("OPTICAL supply agreement", result["טכנולוגיה"]["reason"])
+        self.assertIn("$4.6m", result["טכנולוגיה"]["reason"])
+        self.assertNotIn("מיליארד", result["טכנולוגיה"]["reason"])
 
     def test_delivery_run_reuses_brief_retries_failure_then_skips_duplicate(self):
         fixed_now = datetime(
@@ -854,6 +932,21 @@ class IsraelMarketTests(unittest.TestCase):
         self.assertNotIn("3.50%", corrected)
         self.assertIn("נוסח מחדש", corrected)
         self.assertEqual(len(applied), 1)
+
+    def test_quality_corrections_cannot_change_million_to_billion(self):
+        brief = "החברה דיווחה על עסקה בסך 4.6 מיליון דולר."
+
+        corrected, applied = financial_brief._apply_quality_replacements(
+            brief,
+            [{
+                "old": brief,
+                "new": "החברה דיווחה על עסקה בסך 4.6 מיליארד דולר.",
+                "reason": "unsafe translated magnitude",
+            }],
+        )
+
+        self.assertEqual(corrected, brief)
+        self.assertEqual(applied, [])
 
     def test_quality_review_retries_an_unsafe_correction_with_exact_text(self):
         brief = "### בדיקה\nהמשפט הזה אינו ברור לקורא."

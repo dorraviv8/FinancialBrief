@@ -5,6 +5,65 @@ import weekly_report
 
 
 class WeeklyReportTests(unittest.TestCase):
+    def test_translation_guard_rejects_million_to_billion_error(self):
+        source = "Supply agreement worth $4.6m through 2027"
+
+        self.assertTrue(
+            weekly_report.translation_preserves_source_facts(
+                source,
+                "הסכם אספקה בהיקף 4.6 מיליון דולר עד 2027",
+            )
+        )
+        self.assertFalse(
+            weekly_report.translation_preserves_source_facts(
+                source,
+                "הסכם אספקה בהיקף 4.6 מיליארד דולר עד 2027",
+            )
+        )
+        self.assertFalse(
+            weekly_report.translation_preserves_source_facts(
+                source,
+                "הסכם אספקה בהיקף 4.6 דולר עד 2027",
+            )
+        )
+
+    def test_unfaithful_news_translation_falls_back_to_source_title(self):
+        data = {"sectors": {"טכנולוגיה": {}}}
+        snapshot = {"indices": {}, "sectors": {"טכנולוגיה": {}}}
+        news = [{
+            "id": 7,
+            "source": "מאיה",
+            "reliability": "official",
+            "title": "Supply agreement worth $4.6m through 2027",
+            "summary": "",
+            "companies": [],
+        }]
+
+        parsed = weekly_report.parse_weekly_ai_response(
+            data,
+            snapshot,
+            news,
+            "NEWS|W7|הסכם בהיקף 4.6 מיליארד דולר עד 2027",
+        )
+
+        self.assertEqual(parsed["translation_fallbacks"], ["W7"])
+        self.assertTrue(parsed["selected_news"][0]["translation_fallback"])
+        self.assertIn("$4.6m", parsed["selected_news"][0]["ai_summary"])
+
+    def test_translation_guard_preserves_percent_and_currency_meaning(self):
+        source = "The company sold 4% for NIS 450 million"
+
+        self.assertTrue(
+            weekly_report.translation_preserves_source_facts(
+                source, "החברה מכרה 4% תמורת 450 מיליון שקל"
+            )
+        )
+        self.assertFalse(
+            weekly_report.translation_preserves_source_facts(
+                source, "החברה מכרה 4 מניות תמורת 450 מיליון שקל"
+            )
+        )
+
     def test_shortened_week_uses_previous_close_and_actual_sessions(self):
         metric = weekly_report.weekly_performance(
             [
@@ -81,7 +140,7 @@ class WeeklyReportTests(unittest.TestCase):
         response = ["NEWS|W1|בנק ישראל פרסם החלטת ריבית חדשה."]
         response.extend(
             f"SECTOR|{name}|{'W1' if name == 'בנקים' else 'NONE'}|"
-            f"{'החלטת הריבית השפיעה על סביבת הפעילות.' if name == 'בנקים' else 'NONE'}"
+            f"{'1|4|14|החלטת הריבית השפיעה על סביבת הפעילות.' if name == 'בנקים' else '0|0|1|NONE'}"
             for name in sector_names
         )
         response.extend((
@@ -92,6 +151,18 @@ class WeeklyReportTests(unittest.TestCase):
         analysis = weekly_report.parse_weekly_ai_response(
             data, snapshot, news, "\n".join(response)
         )
+        opportunities = {
+            name: {
+                "final_score": 75 - position,
+                "label": "חזקה",
+                "weekly_change_pct": 5 - position,
+                "previous_weekly_score": 70 - position,
+                "v2_confidence_pct": 60,
+                "opportunity_reason": "המגמה התחזקה השבוע",
+                "invalidation": "ההערכה תיחלש בירידה מתחת לתמיכה.",
+            }
+            for position, name in enumerate(sector_names)
+        }
         brief = weekly_report.build_weekly_brief(
             data,
             snapshot,
@@ -100,8 +171,12 @@ class WeeklyReportTests(unittest.TestCase):
                 "EUR": {"available": False},
             },
             analysis,
+            opportunities,
         )
 
+        self.assertIn("### השוק ב-60 שניות", brief)
+        self.assertIn("### מפת ההזדמנויות השבועית", brief)
+        self.assertIn("שלושת הסקטורים המובילים לבדיקה", brief)
         self.assertEqual(brief.count("### מדד ת״א-"), 3)
         self.assertEqual(brief.count("### סקירת הסקטורים"), 1)
         self.assertIn("סגירת 21/08/2026", brief)

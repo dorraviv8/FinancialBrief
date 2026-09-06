@@ -136,6 +136,22 @@ def init_db():
             ON sector_score_predictions (final_score, sector_name)
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_sector_opportunities (
+                report_date       TEXT NOT NULL,
+                sector_name       TEXT NOT NULL,
+                final_score       INTEGER NOT NULL,
+                graph_score       INTEGER NOT NULL,
+                news_adjustment   INTEGER NOT NULL,
+                confidence_pct    INTEGER NOT NULL,
+                created_at        TEXT NOT NULL,
+                PRIMARY KEY (report_date, sector_name)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_weekly_opportunities_previous
+            ON weekly_sector_opportunities (report_date, sector_name)
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS briefing_runs (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 report_date       TEXT UNIQUE NOT NULL,
@@ -855,6 +871,68 @@ def get_latest_sector_scores() -> dict:
             """
         ).fetchall()
     return {row["sector_name"]: dict(row) for row in rows}
+
+
+def get_previous_weekly_opportunity_scores(report_date: str) -> dict:
+    """Return the latest Sunday opportunity snapshot before this report."""
+    with get_connection() as conn:
+        previous = conn.execute(
+            """
+            SELECT MAX(report_date) AS report_date
+            FROM weekly_sector_opportunities
+            WHERE report_date < ?
+            """,
+            (report_date,),
+        ).fetchone()
+        if not previous or not previous["report_date"]:
+            return {}
+        rows = conn.execute(
+            """
+            SELECT * FROM weekly_sector_opportunities
+            WHERE report_date = ?
+            ORDER BY sector_name
+            """,
+            (previous["report_date"],),
+        ).fetchall()
+    return {row["sector_name"]: dict(row) for row in rows}
+
+
+def save_weekly_opportunity_scores(
+    report_date: str,
+    sector_scores: dict,
+) -> dict:
+    """Persist the approved Sunday ranking for next week's comparison."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = [
+        (
+            report_date,
+            sector_name,
+            int(score.get("final_score", 50)),
+            int(score.get("graph_score", 50)),
+            int(score.get("news_adjustment", 0)),
+            int(score.get("v2_confidence_pct", 0)),
+            now,
+        )
+        for sector_name, score in sector_scores.items()
+    ]
+    with get_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO weekly_sector_opportunities
+                (report_date, sector_name, final_score, graph_score,
+                 news_adjustment, confidence_pct, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(report_date, sector_name) DO UPDATE SET
+                final_score = excluded.final_score,
+                graph_score = excluded.graph_score,
+                news_adjustment = excluded.news_adjustment,
+                confidence_pct = excluded.confidence_pct,
+                created_at = excluded.created_at
+            """,
+            rows,
+        )
+        conn.commit()
+    return {"weekly_opportunities_upserted": len(rows)}
 
 
 # ── Idempotent Briefing Delivery ───────────────────────────────────────────────

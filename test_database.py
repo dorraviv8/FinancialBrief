@@ -61,6 +61,36 @@ class SubscriberBackupTests(unittest.TestCase):
         self.assertFalse(second["created"])
         self.assertEqual(second["reason"], "already_snapshotted_today")
 
+    def test_weekly_opportunity_scores_compare_only_with_previous_sunday(self):
+        first = {
+            "בנקים": {
+                "final_score": 70,
+                "graph_score": 68,
+                "news_adjustment": 2,
+                "v2_confidence_pct": 61,
+            }
+        }
+        current = {
+            "בנקים": {
+                "final_score": 74,
+                "graph_score": 72,
+                "news_adjustment": 2,
+                "v2_confidence_pct": 64,
+            }
+        }
+
+        saved_first = database.save_weekly_opportunity_scores(
+            "2026-09-06", first
+        )
+        database.save_weekly_opportunity_scores("2026-09-13", current)
+        previous = database.get_previous_weekly_opportunity_scores(
+            "2026-09-13"
+        )
+
+        self.assertEqual(saved_first["weekly_opportunities_upserted"], 1)
+        self.assertEqual(previous["בנקים"]["report_date"], "2026-09-06")
+        self.assertEqual(previous["בנקים"]["final_score"], 70)
+
     def test_snapshot_refuses_to_overwrite_when_live_table_lost_rows(self):
         self._add_subscriber("Dor", "dor@example.com", "token-1")
         self._add_subscriber("Rina", "rina@example.com", "token-2")

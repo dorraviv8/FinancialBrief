@@ -5,6 +5,13 @@ a weekly Israeli-market report instead of the daily report. The approved report
 is sent at 08:00. The same prepare, review, 07:55 recovery, and 08:00 delivery
 workflow runs for daily reports on every other day.
 
+The report opens with a deterministic `Market in 60 Seconds` card. It also
+contains a weekly opportunity map for all ten sectors: full-week performance,
+current 0–100 score, change from the preceding Sunday, confidence, and explicit
+invalidation conditions for the three leaders. Approved Sunday scores are stored
+separately so subsequent reports compare Sunday with Sunday rather than with the
+latest weekday observation.
+
 ## Calculation rules
 
 - The calendar window is Monday through Saturday immediately preceding the
@@ -26,9 +33,13 @@ workflow runs for daily reports on every other day.
 - Articles are deduplicated by source and normalized title. Up to 60 weekly
   source items can be retained, while a balanced maximum of 24 candidates is
   sent to the model.
-- Sunday uses one bounded AI request to select up to six material articles,
-  identify only directly supported sector context, and write a plain-language
-  coming-week outlook. All percentages and dates are calculated locally.
+- Sunday uses one bounded AI request to select up to six material articles and
+  identify only directly supported sector context. All percentages, dates,
+  opportunity scores and coming-week outlook sentences are calculated or
+  composed locally from verified fields.
+- Translated summaries are rejected if they add a number, currency or magnitude,
+  or change million to billion. Rejected wording is replaced with the exact
+  source headline. The final QA correction gate enforces the same rule.
 - Once every active recipient has received the weekly report, unused articles
   from that window are deleted. Selected evidence is retained for 90 days.
 

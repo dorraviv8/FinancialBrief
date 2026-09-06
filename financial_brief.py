@@ -13,6 +13,7 @@ import json
 import os
 import re
 import smtplib
+import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -384,6 +385,14 @@ def _parse_news_catalysts(data: dict, ai_text: str) -> dict:
             continue
         if not _news_item_relevant_to_sector(data, sector_name, item):
             continue
+        source_text = f"{item.get('title') or ''} {item.get('summary') or ''}"
+        clean_reason = weekly_report.clean_ai_text(reason).replace("**", "")[:280]
+        if not weekly_report.translation_preserves_source_facts(
+            source_text, clean_reason
+        ):
+            clean_reason = (
+                f"לפי כותרת המקור: {str(item.get('title') or '').strip()}"
+            )[:280]
         reliability_weight = 1.0 if item.get("reliability") == "official" else 0.7
         published = _parse_published_time(item.get("published"))
         age_days = max(
@@ -404,7 +413,7 @@ def _parse_news_catalysts(data: dict, ai_text: str) -> dict:
             "news_id": item_id,
             "event_type": event_type,
             "title": item.get("title"),
-            "reason": reason.strip().replace("**", "")[:280],
+            "reason": clean_reason,
             "relevance_verified": True,
         }
 
@@ -1052,6 +1061,141 @@ def build_reader_dashboard(
     return "### מה השתנה ומה חשוב הבוקר\n" + "\n".join(lines)
 
 
+def build_market_in_60_seconds(
+    data: dict,
+    sector_scores: dict,
+    previous_scores: dict | None = None,
+) -> str:
+    """Give the reader one concise, deterministic decision summary."""
+    previous_scores = previous_scores or {}
+    indices = data.get("indices", {})
+    ta125 = indices.get("ת״א-125", {})
+    ta125_trend = ta125.get("trend", {})
+    ranked_indices = sorted(
+        (
+            (name, index)
+            for name, index in indices.items()
+            if name in {"ת״א-35", "ת״א-90", "ת״א-125"}
+        ),
+        key=lambda item: float(item[1].get("change_1d_pct") or -999),
+        reverse=True,
+    )
+    leading_index = ranked_indices[0] if ranked_indices else ("לא זמין", {})
+    ranked_sectors = sorted(
+        sector_scores.items(),
+        key=lambda item: item[1].get("final_score", 50),
+        reverse=True,
+    )
+    leaders = ", ".join(
+        f"{name} ({score.get('final_score', 50)})"
+        for name, score in ranked_sectors[:3]
+    ) or "לא זמינים"
+    score_changes = [
+        (name, score, _score_delta(name, score, previous_scores))
+        for name, score in ranked_sectors
+    ]
+    score_changes = [item for item in score_changes if item[2] is not None]
+    largest_change = max(
+        score_changes,
+        key=lambda item: abs(item[2]),
+        default=None,
+    )
+    if largest_change and largest_change[2]:
+        change_text = (
+            f"{largest_change[0]} עבר ל-{largest_change[1]['final_score']}/100 "
+            f"({largest_change[2]:+d})"
+        )
+    elif largest_change:
+        change_text = "לא חל שינוי מהותי בציוני הסקטורים"
+    else:
+        change_text = "זהו בסיס ההשוואה הראשון לציונים"
+
+    affected = sorted(
+        (
+            (name, score) for name, score in sector_scores.items()
+            if score.get("news_adjustment", 0)
+        ),
+        key=lambda item: abs(item[1]["news_adjustment"]),
+        reverse=True,
+    )
+    news_text = (
+        f"{affected[0][0]} ({affected[0][1]['news_adjustment']:+d}): "
+        f"{str(affected[0][1]['reason']).rstrip('.')}"
+        if affected else "לא זוהתה כותרת מאומתת ששינתה הבוקר ציון סקטוריאלי"
+    )
+    market_bias = ta125_trend.get("directional_bias") or "לא זמינה"
+    strongest_score = ranked_sectors[0][1].get("final_score", 50) if ranked_sectors else 50
+    bottom_line = (
+        "התמונה חיובית יחסית, אך כדאי לוודא שהעליות נשארות רחבות לפני הגדלת חשיפה."
+        if market_bias == "חיובית" and strongest_score >= 70
+        else "התמונה מעורבת; עדיף להתמקד בסקטורים המובילים ולשמור על משמעת סיכון."
+        if strongest_score >= 55
+        else "התמונה חלשה יחסית; עדיף להמתין לשיפור במדד ובציוני הסקטורים."
+    )
+    return (
+        "### השוק ב-60 שניות\n"
+        f"- **מועד הנתונים:** סגירת {_format_market_date(ta125_trend.get('as_of'))}.\n"
+        f"- **תמונת השוק:** ת״א-125 ברמה {_format_number(ta125.get('last_value'))}, "
+        f"שינוי יומי {_format_pct(ta125.get('change_1d_pct'))} וחודשי "
+        f"{_format_pct(ta125_trend.get('return_20d_pct'))}; המגמה הכמותית {market_bias}.\n"
+        f"- **המדד המוביל היום:** {leading_index[0]} "
+        f"({_format_pct(leading_index[1].get('change_1d_pct'))}).\n"
+        f"- **הסקטורים המובילים כעת:** {leaders}.\n"
+        f"- **השינוי הבולט בציונים:** {change_text}.\n"
+        f"- **החדשות ששינו את התמונה:** {news_text}.\n"
+        f"- **שורה תחתונה:** {bottom_line}"
+    )
+
+
+def build_plain_language_market_outlook(data: dict) -> str:
+    """Create a clear outlook from verified index fields without translation."""
+    indices = data.get("indices", {})
+    ta125 = indices.get("ת״א-125", {})
+    trend = ta125.get("trend", {})
+    bias = trend.get("directional_bias") or "ניטרלית"
+    support = _format_number(trend.get("support_60d"))
+    resistance = _format_number(trend.get("resistance_60d"))
+    rsi = trend.get("rsi_14")
+    breadth = ta125.get("breadth", {})
+    advancers = int(breadth.get("advancers") or 0)
+    decliners = int(breadth.get("decliners") or 0)
+    breadth_risk = (
+        " במקביל, מספר המניות היורדות גדול כעת ממספר המניות העולות."
+        if decliners > advancers else ""
+    )
+    short_direction = {
+        "חיובית": "הנטייה החיובית עשויה להימשך כל עוד ת״א-125 נשאר מעל אזור התמיכה.",
+        "שלילית": "הלחץ עשוי להימשך עד שיופיע שיפור ברור ברוחב השוק ובמחיר המדד.",
+    }.get(bias, "המסחר עשוי להישאר מעורב עד שייווצר כיוון ברור יותר במדד וברוחב השוק.")
+    strength_risk = (
+        f"עוצמת הקניות גבוהה יחסית (RSI-14 ברמה {_format_number(rsi, 1)}), ולכן ייתכן מימוש זמני."
+        if isinstance(rsi, (int, float)) and rsi >= 70 else
+        f"לחץ המכירות גבוה יחסית (RSI-14 ברמה {_format_number(rsi, 1)}), ולכן נדרש אישור לפני הסקת התאוששות."
+        if isinstance(rsi, (int, float)) and rsi <= 30 else
+        "לא נרשם מצב קיצוני בעוצמת הקניות או המכירות."
+    )
+    averages_above = sum(
+        trend.get(f"above_sma_{period}") is True for period in (20, 50, 200)
+    )
+    medium_direction = (
+        f"ת״א-125 נמצא מעל {averages_above} מתוך שלושת ממוצעי המחיר המרכזיים; "
+        f"התשואה בשלושת החודשים האחרונים היא {_format_pct(trend.get('return_3m_pct'))}."
+    )
+    return (
+        "### מבט להמשך\n"
+        "#### הימים הקרובים\n"
+        f"- **הכיוון הסביר:** {short_direction}\n"
+        f"- **מה יכול לשפר את המצב:** סגירה מעל אזור ההתנגדות {resistance}, לצד יותר מניות עולות מיורדות, תחזק את ההערכה החיובית.\n"
+        f"- **מה עלול להחליש את השוק:** {strength_risk}{breadth_risk}\n"
+        f"- **מתי נשנה את ההערכה:** סגירה מתחת לאזור התמיכה {support} תחליש את התרחיש הנוכחי.\n"
+        "#### השבועות הקרובים\n"
+        f"- **הכיוון הסביר:** {medium_direction}\n"
+        "- **מה יכול לשפר את המצב:** הישארות מעל ממוצעי 50 ו-200 הימים, לצד עליות ביותר מניות, תתמוך בהמשך המגמה.\n"
+        "- **מה עלול להחליש את השוק:** היחלשות בו-זמנית במדד, ברוחב השוק ובסקטורים המובילים תגדיל את הסיכון לשינוי מגמה.\n"
+        "- **מתי נשנה את ההערכה:** מעבר של המחיר מתחת לממוצע 200 הימים ומגמה כמותית שלילית יחייבו הערכה מחודשת."
+    )
+
+
 def build_sector_recommendation_summary(
     sector_scores: dict,
     v2_bundle: dict,
@@ -1170,6 +1314,85 @@ def _compact_calibration_sentence(calibration: dict | None) -> str:
     if not ready:
         return "הכיול ההיסטורי עדיין אוסף מקרים; טרם מוצגת מסקנה"
     return "; ".join(ready)
+
+
+def _weekly_catalysts_from_analysis(analysis: dict) -> dict:
+    """Turn source-linked weekly AI classifications into bounded score inputs."""
+    catalysts = {}
+    for sector_name, factor in analysis.get("sector_factors", {}).items():
+        try:
+            direction = max(-1, min(1, int(factor.get("direction", 0))))
+            materiality = max(0, min(5, int(factor.get("materiality", 0))))
+            duration_days = max(1, min(30, int(factor.get("duration_days", 1))))
+        except (TypeError, ValueError):
+            continue
+        reliability_weight = 1.0 if factor.get("reliability") == "official" else 0.7
+        published = _parse_published_time(factor.get("published"))
+        age_days = max(
+            0.0,
+            ((_today() - published).total_seconds() / 86400) if published else 1.0,
+        )
+        freshness = 0.5 ** (age_days / duration_days)
+        adjustment = int(round(
+            direction * materiality * reliability_weight * freshness
+        ))
+        catalysts[sector_name] = {
+            "adjustment": max(-5, min(5, adjustment)),
+            "direction": direction,
+            "materiality": materiality,
+            "duration_days": duration_days,
+            "reliability": factor.get("reliability"),
+            "source": factor.get("source"),
+            "news_id": factor.get("news_id"),
+            "event_type": "weekly_material_event",
+            "title": factor.get("title"),
+            "reason": factor.get("text") or "אירוע שבועי מאומת.",
+            "relevance_verified": True,
+        }
+    return catalysts
+
+
+def build_weekly_opportunity_scores(
+    data: dict,
+    snapshot: dict,
+    analysis: dict,
+    calibration: dict,
+    previous_weekly_scores: dict,
+    model_status: dict,
+) -> tuple[dict, dict]:
+    """Build Sunday's auditable 2–6 week opportunity ranking."""
+    catalysts = _weekly_catalysts_from_analysis(analysis)
+    v2_bundle = recommendation_v2.apply_catalysts(
+        recommendation_v2.build_recommendation_bundle(data), catalysts
+    )
+    legacy_scores = _legacy_scores_from_catalysts(data, catalysts, calibration)
+    scores = _combine_recommendation_scores(
+        legacy_scores, v2_bundle, model_status
+    )
+    for sector_name, score in scores.items():
+        sector = data.get("sectors", {}).get(sector_name, {})
+        trend = sector.get("trend", {})
+        weekly_metric = snapshot.get("sectors", {}).get(sector_name, {})
+        prior = previous_weekly_scores.get(sector_name, {})
+        score["previous_weekly_score"] = prior.get("final_score")
+        score["weekly_change_pct"] = weekly_metric.get("change_pct")
+        score["opportunity_reason"] = (
+            f"השבוע {_format_pct(weekly_metric.get('change_pct'))}, חודש "
+            f"{_format_pct(trend.get('return_20d_pct'))}; "
+            f"ציון גרף {score.get('graph_score', 50)}/100"
+            + (
+                f" והשפעת חדשות {score.get('news_adjustment', 0):+d}"
+                if score.get("news_adjustment") else ""
+            )
+        )
+        support = trend.get("support_60d")
+        score["invalidation"] = (
+            f"ההערכה תיחלש אם מדד הסקטור יסגור מתחת לאזור התמיכה "
+            f"{_format_number(support)} ובמקביל יעבור מתחת לממוצע 50 הימים."
+            if support is not None else
+            "ההערכה תיחלש אם המגמה תעבור לשלילית והמחיר ירד מתחת לממוצע 50 הימים."
+        )
+    return scores, v2_bundle
 
 
 def _selected_sector_names(
@@ -1349,26 +1572,8 @@ def build_reader_quantitative_cards(
 
 
 def build_reader_context_card(data: dict, sector_scores: dict) -> str:
-    """Show only news and currency moves that materially affect the reader."""
+    """Show macro context and evidence links without repeating the top summary."""
     lines = []
-    affected = [
-        (name, score) for name, score in sector_scores.items()
-        if score.get("news_adjustment", 0)
-    ]
-    if affected:
-        for name, score in sorted(
-            affected,
-            key=lambda item: abs(item[1]["news_adjustment"]),
-            reverse=True,
-        ):
-            lines.append(
-                f"- **{name} ({score['news_adjustment']:+d}):** {score['reason']}"
-            )
-    else:
-        lines.append(
-            "- **חדשות:** לא זוהתה היום כותרת ששינתה ציון סקטוריאלי."
-        )
-
     material_rates = []
     for currency in ("USD", "EUR", "GBP"):
         rate = data.get("exchange_rates", {}).get("rates", {}).get(currency, {})
@@ -1413,7 +1618,7 @@ def build_reader_context_card(data: dict, sector_scores: dict) -> str:
         if len(seen_sources) >= 4:
             break
     lines.append("- **מקורות מרכזיים:** " + ", ".join(source_links) + ".")
-    return "### חדשות, מאקרו ומקורות\n" + "\n".join(lines)
+    return "### מאקרו ומקורות\n" + "\n".join(lines)
 
 
 def validate_market_data(data: dict) -> None:
@@ -1451,13 +1656,34 @@ def _groq_completion(
     max_tokens: int,
     purpose: str,
 ) -> str:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.25,
-        max_tokens=max_tokens,
-        reasoning_effort="low",
-    )
+    response = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.25,
+                max_tokens=max_tokens,
+                reasoning_effort="low",
+            )
+            break
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != 429 or attempt == 2:
+                raise
+            retry_after = 0.0
+            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+            try:
+                retry_after = float(headers.get("retry-after", 0))
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            wait_seconds = min(10.0, max(2.0, retry_after + 0.5, 2.0 ** attempt))
+            print(
+                f"AI rate limit [{purpose}]; retrying in {wait_seconds:.1f}s "
+                f"({attempt + 1}/2)"
+            )
+            time.sleep(wait_seconds)
+    if response is None:
+        raise RuntimeError(f"AI request [{purpose}] returned no response")
     usage = getattr(response, "usage", None)
     if usage:
         print(
@@ -1498,31 +1724,6 @@ def generate_hebrew_brief(
         "comparison": {"sample_size": 0},
     }
     v2_base_bundle = recommendation_v2.build_recommendation_bundle(data)
-    market_data = json.dumps(
-        _compact_market_payload(data),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    date_label = _today().strftime("%d.%m.%Y")
-
-    market_prompt = f"""אתה אנליסט הבורסה בתל אביב. כתוב בעברית תקנית וקצרה ל-{date_label}, על סמך הנתונים בלבד.
-
-כללים: אין הקדמה, פרופיל משקיע, טבלה, מידע חיצוני, מספר מומצא, הבטחת תשואה או הוראת קנייה. הפרד עובדה מתחזית. n<200 פירושו היסטוריה קצרה משנה וביטחון מופחת. התייחס לתשואות 1/3/6/12 חודשים, לממוצעי המחיר, לעוצמת הקונים והמוכרים, לכיוון התנועה, לתמיכה ולהתנגדות. הנתונים הטכניים הם אינדיקציה בלבד. השתמש במילים "מניות עולות" ו"מניות יורדות", לא בתרגום מילולי מאנגלית. אל תסיק השפעה על יבואנים, יצואנים או רווחי חברות משינוי מטבע בלבד. בדוק שכל משפט סיבתי נתמך ישירות בנתונים שסופקו ושמור על דקדוק עברי תקין.
-
-כתוב לקורא ללא רקע בניתוח טכני, עד 220 מילים ובדיוק את הסעיפים הבאים:
-### תמונת מצב בבורסה בתל אביב
-סיכום הסגירה והמסר המרכזי. אל תציין תאריך בעצמך; המערכת תוסיף את תאריך הסגירה הרשמי.
-
-### מבט להמשך
-חלק לשתי פסקאות: "הימים הקרובים" (1–5 ימי מסחר) ו"השבועות הקרובים" (2–6 שבועות). בכל פסקה השתמש בארבעה משפטים קצרים עם התוויות: **הכיוון הסביר**, **מה יכול לשפר את המצב**, **מה עלול להחליש את השוק**, **מתי נשנה את ההערכה**. הסבר את הסיבה במילים יומיומיות.
-
-אסור להשתמש בלי הסבר במילים טריגר, מומנטום, אישור, ביטול, שורי, דובי, RSI, MACD או SMA. אם חייבים לציין מדד טכני, כתוב קודם את המשמעות הפשוטה ורק אחר כך את שמו בסוגריים. לדוגמה: "המחיר נשאר מעל הממוצע של 50 הימים האחרונים (SMA-50)".
-
-מקרא: ret_1m_3m_6m_1y_pct=תשואות; above_sma_20_50_200=מיקום מעל הממוצעים; macd_hist=היסטוגרמת MACD; support_resistance_60d=תמיכה/התנגדות; turnover_x_avg20=מחזור יחסי; trendline_60d_200d_pct=קווי מגמה.
-
-נתונים:
-{market_data}"""
-
     sector_event_scope = json.dumps(
         {
             name: {
@@ -1555,15 +1756,7 @@ CATALYST|שם הסקטור|מזהה חדשות כגון M0/N2 או NONE|סוג �
 סקטורים וחברות מובילות: {sector_event_scope}
 חדשות שסופקו: {sector_news}"""
 
-    market_brief = _groq_completion(
-        client, model, market_prompt, max_tokens=1200, purpose="market"
-    )
-    _require_ai_sections(market_brief, ("תמונת מצב בבורסה בתל אביב", "מבט להמשך"))
-    market_brief = market_brief.replace(
-        "### תמונת מצב בבורסה בתל אביב",
-        "### תמונת מצב בבורסה בתל אביב\n" + _market_close_notice(data) + "\n",
-        1,
-    )
+    market_brief = build_plain_language_market_outlook(data)
     sector_brief_raw = _groq_completion(
         client, model, sector_prompt, max_tokens=700, purpose="sector-events"
     )
@@ -1585,10 +1778,9 @@ CATALYST|שם הסקטור|מזהה חדשות כגון M0/N2 או NONE|סוג �
             "model_status": model_status,
             "catalysts": catalysts,
         })
-    sector_brief = build_sector_recommendation_summary(
-        sector_scores, v2_bundle
+    market_summary = build_market_in_60_seconds(
+        data, sector_scores, previous_scores
     )
-    dashboard = build_reader_dashboard(sector_scores, previous_scores)
     quantitative_cards = build_reader_quantitative_cards(
         data,
         sector_scores,
@@ -1597,9 +1789,8 @@ CATALYST|שם הסקטור|מזהה חדשות כגון M0/N2 או NONE|סוג �
     )
     context_card = build_reader_context_card(data, sector_scores)
     return "\n\n".join([
+        market_summary,
         market_brief,
-        dashboard,
-        sector_brief,
         quantitative_cards,
         context_card,
     ])
@@ -1636,7 +1827,10 @@ def generate_weekly_hebrew_brief(
     report_date,
     fx_rates: dict,
     news_items: list[dict],
-) -> tuple[str, dict, dict]:
+    calibration: dict,
+    previous_weekly_scores: dict,
+    model_status: dict,
+) -> tuple[str, dict, dict, dict]:
     """Generate one bounded weekly editorial pass over deterministic metrics."""
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is required to generate the weekly briefing")
@@ -1650,13 +1844,23 @@ def generate_weekly_hebrew_brief(
         client,
         GROQ_MODEL,
         weekly_report.weekly_ai_prompt(snapshot, fx_rates, news_items),
-        max_tokens=1800,
+        max_tokens=1500,
         purpose="weekly-summary",
     )
     analysis = weekly_report.parse_weekly_ai_response(
         data, snapshot, news_items, response
     )
-    brief = weekly_report.build_weekly_brief(data, snapshot, fx_rates, analysis)
+    opportunity_scores, _v2_bundle = build_weekly_opportunity_scores(
+        data,
+        snapshot,
+        analysis,
+        calibration,
+        previous_weekly_scores,
+        model_status,
+    )
+    brief = weekly_report.build_weekly_brief(
+        data, snapshot, fx_rates, analysis, opportunity_scores
+    )
     metadata = {
         "window_start": snapshot["window_start"],
         "window_end": snapshot["window_end"],
@@ -1665,8 +1869,10 @@ def generate_weekly_hebrew_brief(
             for item in analysis.get("selected_news", [])
             if int(item["id"]) < 900_000
         ],
+        "translation_fallbacks": len(analysis.get("translation_fallbacks", [])),
+        "active_recommendation_model": model_status.get("active_model", "v1"),
     }
-    return brief, metadata, snapshot
+    return brief, metadata, snapshot, opportunity_scores
 
 
 def _quality_fact_tokens(value: str) -> list[str]:
@@ -1684,7 +1890,7 @@ def _deterministic_quality_issues(
     for residue in ("CATALYST|", "SCORE|", "OUTLOOK|", "QA|", "```"):
         if residue in brief_text:
             issues.append(f"machine or invalid residue remains: {residue}")
-    for invalid_value in ("None", "nan"):
+    for invalid_value in ("None", "nan", "true", "false"):
         if re.search(rf"(?<![A-Za-z]){invalid_value}(?![A-Za-z])", brief_text):
             issues.append(f"standalone invalid value remains: {invalid_value}")
     if "פרופיל משקיע" in brief_text:
@@ -1692,11 +1898,13 @@ def _deterministic_quality_issues(
 
     if report_type == "weekly":
         required = (
+            "### השוק ב-60 שניות",
             "### החדשות המרכזיות של השבוע",
             "### מדד ת״א-35 — ביצוע שבועי",
             "### מדד ת״א-90 — ביצוע שבועי",
             "### מדד ת״א-125 — ביצוע שבועי",
             "### מטבע חוץ — שינוי שבועי",
+            "### מפת ההזדמנויות השבועית",
             "### סקירת הסקטורים",
             "### מבט לשבוע הבא",
         )
@@ -1711,15 +1919,27 @@ def _deterministic_quality_issues(
                     issues.append(f"weekly window date is missing: {value}")
     else:
         required = (
-            "### תמונת מצב בבורסה בתל אביב",
+            "### השוק ב-60 שניות",
             "### מבט להמשך",
             "### מדדי תל אביב – תמונת סגירה",
             "### דירוג כל הסקטורים",
-            "### חדשות, מאקרו ומקורות",
+            "### מאקרו ומקורות",
         )
+        for duplicate_title in (
+            "### תמונת מצב בבורסה בתל אביב",
+            "### מה השתנה ומה חשוב הבוקר",
+            "### סקטורים בולטים ותובנות AI",
+            "### מבט סקטוריאלי להמשך",
+        ):
+            if duplicate_title in brief_text:
+                issues.append(
+                    f"duplicate legacy summary section remains: {duplicate_title}"
+                )
     for title in required:
         if title not in brief_text:
             issues.append(f"required section missing: {title}")
+    if brief_text.count("### השוק ב-60 שניות") != 1:
+        issues.append("the 60-second market summary must appear exactly once")
     if report_type == "weekly" and brief_text.count("### סקירת הסקטורים") != 1:
         issues.append("weekly sectors must appear in exactly one card")
     if brief_text.count("https://") < 3:
@@ -1751,12 +1971,14 @@ def _apply_quality_replacements(
     applied = []
     for replacement in replacements[:5]:
         old = str(replacement.get("old") or "").strip()
-        new = str(replacement.get("new") or "").strip()
+        new = weekly_report.clean_ai_text(replacement.get("new"))
         if not old or not new or old == new or corrected.count(old) != 1:
             continue
         if "\n" in old or "\n" in new or "###" in new or "|" in new:
             continue
         if _quality_fact_tokens(old) != _quality_fact_tokens(new):
+            continue
+        if not weekly_report.translation_preserves_source_facts(old, new):
             continue
         if re.findall(r"https?://[^\s)]+", old) != re.findall(r"https?://[^\s)]+", new):
             continue
@@ -1812,6 +2034,8 @@ def review_and_correct_brief(
         raise RuntimeError("GROQ_API_KEY is required for report quality review")
 
     prompt = f"""אתה עורך בקרה אחרון לדוח שוק ההון הישראלי. קרא את הדוח המלא ובדוק עברית, בהירות לקורא ללא ידע טכני, סתירות פנימיות וטענות שאינן נתמכות בהקשר העובדתי. המספרים, התאריכים, הטבלאות והקישורים חושבו מקומית: אין לשנות אותם. אין להוסיף מידע חיצוני, תחזית חדשה או המלצת קנייה.
+
+בדוק במיוחד תרגום מאנגלית לעברית: כל מספר, אחוז, שנה, מטבע ויחידת גודל חייבים לשמור בדיוק על משמעות המקור. million, mn, m או מ׳ הם מיליון; billion או bn הם מיליארד. אסור להחליף מיליון במיליארד, לשנות שם חברה/אדם/מוצר או להרחיב קיצור באמצעות ניחוש. במקרה של ספק יש לנסח בלי הפרט הלא-ודאי.
 
 אם הדוח ברור ונתמך, החזר JSON בלבד:
 {{"status":"pass","summary":"הסבר קצר","replacements":[]}}
@@ -2175,7 +2399,9 @@ def run(
         "v2_outcomes_settled": 0,
         "v2_features_upserted": 0,
         "v2_predictions_upserted": 0,
+        "weekly_opportunities_upserted": 0,
     }
+    weekly_generated_scores = {}
 
     if existing_run:
         brief_text = existing_run["brief_text"]
@@ -2237,11 +2463,32 @@ def run(
                         fx_rates[currency] = stored_fx_rates.get(
                             currency, {"available": False}
                         )
-            brief_text, report_metadata, weekly_snapshot = generate_weekly_hebrew_brief(
+            weekly_graph_scores = {
+                name: calculate_sector_graph_score(sector)
+                for name, sector in data.get("sectors", {}).items()
+            }
+            weekly_calibration = database.get_sector_score_calibration(
+                weekly_graph_scores
+            )
+            previous_weekly_scores = database.get_previous_weekly_opportunity_scores(
+                report_date
+            )
+            weekly_model_status = database.choose_active_recommendation_model(
+                os.getenv("RECOMMENDATION_V2_MODE", "shadow")
+            )
+            (
+                brief_text,
+                report_metadata,
+                weekly_snapshot,
+                weekly_generated_scores,
+            ) = generate_weekly_hebrew_brief(
                 data,
                 now.date(),
                 fx_rates,
                 news_items,
+                weekly_calibration,
+                previous_weekly_scores,
+                weekly_model_status,
             )
             market_close_date = (
                 weekly_snapshot.get("indices", {})
@@ -2259,6 +2506,14 @@ def run(
                     }
                     for item in news_items[:24]
                 ],
+                "weekly_opportunity_scores": {
+                    name: {
+                        "score": score.get("final_score"),
+                        "weekly_change_pct": score.get("weekly_change_pct"),
+                        "confidence_pct": score.get("v2_confidence_pct"),
+                    }
+                    for name, score in weekly_generated_scores.items()
+                },
             }
         else:
             graph_scores = {
@@ -2318,6 +2573,10 @@ def run(
                         generated_scores,
                         model_status["active_model"],
                     ))
+            else:
+                tracking.update(database.save_weekly_opportunity_scores(
+                    report_date, weekly_generated_scores
+                ))
             briefing_run = database.save_briefing_run(
                 report_date,
                 market_close_date,

@@ -27,6 +27,115 @@ MATERIAL_TERMS = (
     "דוחות", "רווח", "הפסד", "תחזית", "עסקה", "מיזוג", "הנפק", "גז",
 )
 
+_MAGNITUDE_PATTERNS = {
+    "thousand": re.compile(
+        r"(?:(?<=\d)k\b|\bthousand(?:s)?\b|אל(?:ף|פים))",
+        re.IGNORECASE,
+    ),
+    "million": re.compile(
+        r"(?:(?<=\d)m\b|\bm(?:illion|illions|n)\b|מיל(?:יון|יוני|׳|')|מ[׳'])",
+        re.IGNORECASE,
+    ),
+    "billion": re.compile(
+        r"(?:(?<=\d)b\b|\bb(?:illion|illions|n)\b|מיליארד(?:י|ים)?)",
+        re.IGNORECASE,
+    ),
+    "trillion": re.compile(
+        r"(?:(?<=\d)t\b|\btrillion(?:s)?\b|טריליון(?:ים)?)",
+        re.IGNORECASE,
+    ),
+}
+_CURRENCY_PATTERNS = {
+    "usd": re.compile(r"(?:\busd\b|\$|דולר(?:ים)?)", re.IGNORECASE),
+    "eur": re.compile(r"(?:\beur\b|€|אירו)", re.IGNORECASE),
+    "ils": re.compile(r"(?:\b(?:ils|nis)\b|₪|שקל(?:ים)?)", re.IGNORECASE),
+}
+_MEASURE_PATTERNS = {
+    "percent": re.compile(r"(?:%|\bpercent\b|אחוז(?:ים)?)", re.IGNORECASE),
+    "basis_points": re.compile(
+        r"(?:\bbps\b|basis points?|נקוד(?:ה|ות) בסיס)", re.IGNORECASE
+    ),
+}
+
+
+def _numeric_values(value: str) -> set[str]:
+    """Normalize numbers so 4.60 and 4,6 compare as the same source fact."""
+    result = set()
+    for raw in re.findall(r"(?<![A-Za-zא-ת])[-+]?\d[\d,]*(?:\.\d+)?", value or ""):
+        try:
+            result.add(f"{float(raw.replace(',', '')):.8g}")
+        except ValueError:
+            continue
+    return result
+
+
+def _labels_by_nearby_number(value: str, patterns: dict) -> dict[str, set[str]]:
+    number_spans = []
+    for match in re.finditer(
+        r"(?<![A-Za-zא-ת])[-+]?\d[\d,]*(?:\.\d+)?", value or ""
+    ):
+        try:
+            normalized = f"{float(match.group().replace(',', '')):.8g}"
+        except ValueError:
+            continue
+        number_spans.append((normalized, match.start(), match.end()))
+    result = {}
+    for label, pattern in patterns.items():
+        for label_match in pattern.finditer(value or ""):
+            nearby = []
+            for number, start, end in number_spans:
+                distance = min(
+                    abs(label_match.start() - end),
+                    abs(start - label_match.end()),
+                )
+                if distance <= 12:
+                    nearby.append((distance, number))
+            if nearby:
+                _distance, number = min(nearby)
+                result.setdefault(number, set()).add(label)
+    return result
+
+
+def translation_preserves_source_facts(source_text: str, translated_text: str) -> bool:
+    """Reject translated claims that invent numbers, units or currency labels."""
+    if not translated_text.strip():
+        return False
+    source_numbers = _numeric_values(source_text)
+    translated_numbers = _numeric_values(translated_text)
+    if not translated_numbers.issubset(source_numbers):
+        return False
+    for patterns in (
+        _MAGNITUDE_PATTERNS,
+        _CURRENCY_PATTERNS,
+        _MEASURE_PATTERNS,
+    ):
+        source_labels = {
+            label for label, pattern in patterns.items() if pattern.search(source_text or "")
+        }
+        translated_labels = {
+            label for label, pattern in patterns.items() if pattern.search(translated_text or "")
+        }
+        if not translated_labels.issubset(source_labels):
+            return False
+        if patterns is _MAGNITUDE_PATTERNS or patterns is _MEASURE_PATTERNS:
+            source_pairs = _labels_by_nearby_number(source_text, patterns)
+            translated_pairs = _labels_by_nearby_number(translated_text, patterns)
+            for number, labels in source_pairs.items():
+                if number in translated_numbers and not labels.issubset(
+                    translated_pairs.get(number, set())
+                ):
+                    return False
+    return True
+
+
+def _safe_source_summary(item: dict) -> str:
+    title = str(item.get("title") or "").strip()
+    return title or "פרטי הדיווח זמינים בקישור למקור."
+
+
+def clean_ai_text(value: str) -> str:
+    return str(value or "").replace('\\"', '"').replace("\\'", "'").strip()
+
 
 def calendar_week_window(report_date: date) -> tuple[date, date]:
     """Return Monday through Saturday immediately preceding a Sunday report."""
@@ -228,14 +337,13 @@ def weekly_ai_prompt(snapshot: dict, fx_rates: dict, news_items: list[dict]) -> 
     sector_names = ", ".join(snapshot.get("sectors", {}))
     return f"""אתה עורך שבועי של שוק ההון הישראלי. השתמש רק בנתונים ובכתבות שסופקו. כתוב עברית תקנית, בהירה וקצרה לקורא שאינו מכיר מונחים טכניים.
 
-בחר עד שש כתבות שהיו המהותיות והמשפיעות ביותר למשקיעים במהלך השבוע. העדף מקור רשמי, אירוע בעל השפעה רחבה, דוחות/תחזיות/רגולציה ואירוע שמסביר תנועה במדד או בסקטור. אל תמציא עובדות מעבר לכותרת ולתקציר. לכל סקטור מותר לשייך לכל היותר כתבה אחת ורק אם הקשר ישיר. לבסוף כתוב תחזית זהירה לשבוע הבא, עם תרחיש בסיס, גורם חיובי וגורם סיכון, במילים יומיומיות וללא הוראת קנייה או הבטחת תשואה.
+בחר עד שש כתבות שהיו המהותיות והמשפיעות ביותר למשקיעים במהלך השבוע. העדף מקור רשמי, אירוע בעל השפעה רחבה, דוחות/תחזיות/רגולציה ואירוע שמסביר תנועה במדד או בסקטור. אל תמציא עובדות מעבר לכותרת ולתקציר. לכל סקטור מותר לשייך לכל היותר כתבה אחת ורק אם הקשר ישיר.
+
+כללי תרגום מחייבים: העתק במדויק כל מספר, אחוז, שנה, מטבע ויחידת גודל מהמקור. million, mn, m או מ׳ פירושם מיליון; billion או bn פירושם מיליארד. אסור להחליף מיליון במיליארד או להפך. אין לתרגם או לשנות שם חברה, סימול, שם מוצר או שם אדם. אם פרט באנגלית אינו חד-משמעי, השמט אותו במקום לנחש.
 
 החזר אך ורק שורות במבנה הבא, בלי Markdown:
 NEWS|Wמספר|סיכום עובדתי וברור של משפט אחד
-SECTOR|שם סקטור|Wמספר או NONE|גורם מרכזי במשפט קצר, או NONE אם אין קשר חדשותי ישיר
-OUTLOOK|תרחיש בסיס במשפט אחד
-OUTLOOK|מה עשוי לתמוך בשוק במשפט אחד
-OUTLOOK|מה עלול להכביד על השוק במשפט אחד
+SECTOR|שם סקטור|Wמספר או NONE|כיוון -1/0/1|מהותיות 0-5|משך צפוי בימים 1-30|גורם מרכזי במשפט קצר, או NONE אם אין קשר חדשותי ישיר
 
 כתוב שורת SECTOR אחת לכל אחד מעשרת הסקטורים האלה: {sector_names}.
 נתונים: {payload}"""
@@ -273,6 +381,7 @@ def parse_weekly_ai_response(
     summaries = {}
     factors = {}
     outlook = []
+    translation_fallbacks = []
     for raw_line in (response or "").splitlines():
         line = raw_line.strip()
         if line.startswith("NEWS|"):
@@ -282,17 +391,50 @@ def parse_weekly_ai_response(
             item_id = parts[1]
             if item_id not in selected and len(selected) < 6:
                 selected.append(item_id)
-                summaries[item_id] = parts[2].strip()[:360]
+                summary = clean_ai_text(parts[2])[:360]
+                item = by_protocol_id[item_id]
+                source_text = f"{item.get('title') or ''} {item.get('summary') or ''}"
+                if translation_preserves_source_facts(source_text, summary):
+                    summaries[item_id] = summary
+                else:
+                    summaries[item_id] = _safe_source_summary(item)
+                    translation_fallbacks.append(item_id)
         elif line.startswith("SECTOR|"):
-            parts = line.split("|", 3)
-            if len(parts) != 4 or parts[1] not in snapshot.get("sectors", {}):
+            parts = line.split("|", 6)
+            if len(parts) not in {4, 7} or parts[1] not in snapshot.get("sectors", {}):
                 continue
-            sector_name, item_id, reason = parts[1], parts[2], parts[3].strip()
+            sector_name, item_id = parts[1], parts[2]
+            if len(parts) == 7:
+                direction_text, materiality_text, duration_text, reason = parts[3:]
+            else:
+                direction_text, materiality_text, duration_text, reason = "0", "0", "1", parts[3]
+            reason = clean_ai_text(reason)
             item = by_protocol_id.get(item_id)
-            if item and _news_relevant_to_sector(data, sector_name, item):
+            source_text = (
+                f"{item.get('title') or ''} {item.get('summary') or ''}"
+                if item else ""
+            )
+            try:
+                direction = max(-1, min(1, int(direction_text)))
+                materiality = max(0, min(5, int(materiality_text)))
+                duration_days = max(1, min(30, int(duration_text)))
+            except ValueError:
+                continue
+            if (
+                item
+                and _news_relevant_to_sector(data, sector_name, item)
+                and translation_preserves_source_facts(source_text, reason)
+            ):
                 factors[sector_name] = {
                     "news_id": int(item["id"]),
                     "text": reason[:300],
+                    "direction": direction,
+                    "materiality": materiality,
+                    "duration_days": duration_days,
+                    "reliability": item.get("reliability"),
+                    "source": item.get("source"),
+                    "published": item.get("published"),
+                    "title": item.get("title"),
                 }
         elif line.startswith("OUTLOOK|"):
             # Some models repeat a requested label as a middle protocol field.
@@ -326,11 +468,13 @@ def parse_weekly_ai_response(
             {
                 **item,
                 "ai_summary": summaries.get(f"W{item['id']}", item.get("title")),
+                "translation_fallback": f"W{item['id']}" in translation_fallbacks,
             }
             for item in selected_items
         ],
         "sector_factors": factors,
         "outlook": outlook[:3],
+        "translation_fallbacks": translation_fallbacks,
     }
 
 
@@ -358,6 +502,172 @@ def _format_pct(value) -> str:
 def _published_date(value) -> str:
     if not value:
         return ""
+
+
+def _confidence_label(value) -> str:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0
+    if confidence >= 75:
+        return "גבוהה"
+    if confidence >= 55:
+        return "בינונית"
+    return "נמוכה"
+
+
+def build_weekly_market_in_60_seconds(
+    snapshot: dict,
+    analysis: dict,
+    opportunity_scores: dict,
+) -> str:
+    available_indices = [
+        (name, metric)
+        for name, metric in snapshot.get("indices", {}).items()
+        if metric.get("available")
+    ]
+    leading_index = max(
+        available_indices,
+        key=lambda item: item[1].get("change_pct", -999),
+        default=("לא זמין", {}),
+    )
+    available_sectors = [
+        (name, metric)
+        for name, metric in snapshot.get("sectors", {}).items()
+        if metric.get("available")
+    ]
+    leading_sector = max(
+        available_sectors,
+        key=lambda item: item[1].get("change_pct", -999),
+        default=("לא זמין", {}),
+    )
+    ranked = sorted(
+        opportunity_scores.items(),
+        key=lambda item: item[1].get("final_score", 50),
+        reverse=True,
+    )
+    leaders = ", ".join(
+        f"{name} ({score.get('final_score', 50)})"
+        for name, score in ranked[:3]
+    ) or "הדירוג אינו זמין"
+    selected_news = analysis.get("selected_news", [])
+    if selected_news:
+        event_item = selected_news[0]
+        event_text = (
+            event_item.get("title")
+            if event_item.get("translation_fallback")
+            else event_item.get("ai_summary")
+        )
+        event = f"{event_item.get('source')}: {event_text}"
+    else:
+        event = "לא זוהה אירוע יחיד ששינה את תמונת השוק"
+    ta125_change = (
+        snapshot.get("indices", {}).get("ת״א-125", {}).get("change_pct")
+    )
+    strongest_score = ranked[0][1].get("final_score", 50) if ranked else 50
+    bottom_line = (
+        "השבוע היה חיובי וגם קיימים סקטורים בעלי ציון חזק, אך יש לבדוק שהמגמה נשמרת בפתיחת השבוע."
+        if isinstance(ta125_change, (int, float)) and ta125_change > 0 and strongest_score >= 70
+        else "התמונה מעורבת; כדאי להתמקד בפערים בין הסקטורים ולא להסיק ממדד יחיד על כל השוק."
+    )
+    return (
+        "### השוק ב-60 שניות\n"
+        f"- **תקופת הסיכום:** {_format_date(snapshot.get('window_start'))}–"
+        f"{_format_date(snapshot.get('window_end'))}.\n"
+        f"- **המדד הבולט:** {leading_index[0]} "
+        f"({_format_pct(leading_index[1].get('change_pct'))}).\n"
+        f"- **הסקטור הבולט בביצועים:** {leading_sector[0]} "
+        f"({_format_pct(leading_sector[1].get('change_pct'))}).\n"
+        f"- **הסקטורים המובילים לשבועות הקרובים:** {leaders}.\n"
+        f"- **האירוע המרכזי:** {event.rstrip('.')}.\n"
+        f"- **שורה תחתונה:** {bottom_line}"
+    )
+
+
+def build_weekly_opportunity_map(opportunity_scores: dict) -> str:
+    if not opportunity_scores:
+        return (
+            "### מפת ההזדמנויות השבועית\n"
+            "- ציוני ההזדמנות אינם זמינים השבוע."
+        )
+    ranked = sorted(
+        opportunity_scores.items(),
+        key=lambda item: item[1].get("final_score", 50),
+        reverse=True,
+    )
+    rows = [
+        "| # | סקטור | שבועי | ציון נוכחי | שינוי מהשבוע הקודם | ביטחון |",
+        "|---:|---|---:|---:|---:|---|",
+    ]
+    for position, (name, score) in enumerate(ranked, 1):
+        previous = score.get("previous_weekly_score")
+        delta = (
+            f"{int(score.get('final_score', 50)) - int(previous):+d}"
+            if previous is not None else "חדש"
+        )
+        rows.append(
+            f"| {position} | {name} | {_format_pct(score.get('weekly_change_pct'))} | "
+            f"{score.get('final_score', 50)}/100 – {score.get('label', '')} | "
+            f"{delta} | {_confidence_label(score.get('v2_confidence_pct'))} |"
+        )
+    details = [
+        "#### שלושת הסקטורים המובילים לבדיקה"
+    ]
+    for name, score in ranked[:3]:
+        details.append(
+            f"- **{name} – {score.get('final_score', 50)}/100:** "
+            f"{score.get('opportunity_reason')}. "
+            f"רמת הביטחון {_confidence_label(score.get('v2_confidence_pct'))}. "
+            f"{score.get('invalidation')}"
+        )
+    explanation = (
+        "הציון משווה אטרקטיביות ל-2–6 שבועות ומשלב נתוני גרף, "
+        "כיול היסטורי ואירוע חדשותי רק לאחר אימות המקור. הוא אינו הבטחת תשואה."
+    )
+    return (
+        "### מפת ההזדמנויות השבועית\n"
+        f"{explanation}\n" + "\n".join(rows + details)
+    )
+
+
+def build_plain_language_weekly_outlook(snapshot: dict, fx_rates: dict) -> str:
+    ta125 = snapshot.get("indices", {}).get("ת״א-125", {})
+    change = ta125.get("change_pct")
+    positive_sectors = sum(
+        metric.get("available") and (metric.get("change_pct") or 0) > 0
+        for metric in snapshot.get("sectors", {}).values()
+    )
+    sector_count = sum(
+        metric.get("available")
+        for metric in snapshot.get("sectors", {}).values()
+    )
+    usd_change = fx_rates.get("USD", {}).get("change_pct")
+    base = (
+        f"לאחר שינוי שבועי של {_format_pct(change)} בת״א-125, תרחיש הבסיס הוא "
+        "המשך חיובי מתון, כל עוד העליות נשארות רחבות בין הסקטורים."
+        if isinstance(change, (int, float)) and change > 0.5 else
+        f"לאחר שינוי שבועי של {_format_pct(change)} בת״א-125, תרחיש הבסיס הוא "
+        "מסחר זהיר עד שיופיע שיפור רחב יותר במדדים ובסקטורים."
+        if isinstance(change, (int, float)) and change < -0.5 else
+        "תרחיש הבסיס הוא מסחר מעורב, עד שתתקבל מגמה ברורה יותר בת״א-125."
+    )
+    support = (
+        f"עליות ב-{positive_sectors} מתוך {sector_count} סקטורים גם בשבוע הבא "
+        "יחזקו את התרחיש החיובי."
+        if sector_count else
+        "שיפור רחב במספר הסקטורים העולים יחזק את התרחיש החיובי."
+    )
+    risk = (
+        f"הדולר התחזק השבוע מול השקל בשיעור {_format_pct(usd_change)}; התחזקות נוספת "
+        "לצד היחלשות במדדים עלולה להגדיל את התנודתיות."
+        if isinstance(usd_change, (int, float)) and usd_change > 0.5 else
+        "ירידה בת״א-125 במקביל למעבר של רוב הסקטורים לירידות תחליש את התרחיש."
+    )
+    return "\n".join((
+        f"- **תרחיש בסיס:** {base}",
+        f"- **מה עשוי לתמוך בשוק:** {support}",
+        f"- **מה עלול להכביד:** {risk}",
+    ))
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return parsed.strftime("%d/%m/%Y")
@@ -370,10 +680,16 @@ def build_weekly_brief(
     snapshot: dict,
     fx_rates: dict,
     analysis: dict,
+    opportunity_scores: dict | None = None,
 ) -> str:
     start_label = _format_date(snapshot["window_start"])
     end_label = _format_date(snapshot["window_end"])
-    sections = []
+    opportunity_scores = opportunity_scores or {}
+    sections = [
+        build_weekly_market_in_60_seconds(
+            snapshot, analysis, opportunity_scores
+        )
+    ]
 
     news_lines = [
         f"- **תקופת הסיכום:** {start_label}–{end_label}. נבחרו רק אירועים בעלי חשיבות למשקיעים."
@@ -385,9 +701,12 @@ def build_weekly_brief(
         linked_title = f"[{title}]({link})" if link else title
         published = _published_date(item.get("published"))
         date_note = f", {published}" if published else ""
-        news_lines.append(
-            f"- **{source}{date_note}:** {item.get('ai_summary')} ({linked_title})"
-        )
+        if item.get("translation_fallback"):
+            news_lines.append(f"- **{source}{date_note}:** {linked_title}")
+        else:
+            news_lines.append(
+                f"- **{source}{date_note}:** {item.get('ai_summary')} ({linked_title})"
+            )
     if len(news_lines) == 1:
         news_lines.append("- לא נשמרו השבוע חדשות מהותיות בעלות מקור וקישור תקינים.")
     sections.append("### החדשות המרכזיות של השבוע\n" + "\n".join(news_lines))
@@ -425,6 +744,8 @@ def build_weekly_brief(
         fx_lines.append(f"- [מקור: בנק ישראל]({source})")
     sections.append("### מטבע חוץ — שינוי שבועי\n" + "\n".join(fx_lines))
 
+    sections.append(build_weekly_opportunity_map(opportunity_scores))
+
     sector_lines = [
         f"- **תקופת המדידה:** שבוע המסחר שבין {start_label} ל-{end_label}; החישוב הוא מסגירת הבסיס שלפני פתיחת השבוע ועד הסגירה האחרונה."
     ]
@@ -435,16 +756,14 @@ def build_weekly_brief(
                 f"**{name}: {_format_pct(metric.get('change_pct'))}.** "
                 f"הסקטור נסחר השבוע במשך {metric.get('sessions')} ימי מסחר"
             )
-            sentence += f"; ברקע בלט: {factor}." if factor else "; לא נמצא אירוע חדשותי ישיר ומהותי שמסביר לבדו את השינוי."
+            sentence += f"; ברקע בלט: {factor.rstrip('.')}." if factor else "; לא נמצא אירוע חדשותי ישיר ומהותי שמסביר לבדו את השינוי."
         else:
             sentence = f"**{name}:** אין מספיק נתוני סגירה לחישוב שבועי אמין."
         sector_lines.append(f"- {sentence}")
     sections.append("### סקירת הסקטורים\n" + "\n".join(sector_lines))
 
-    outlook_labels = ("תרחיש בסיס", "מה עשוי לתמוך בשוק", "מה עלול להכביד")
-    outlook_lines = [
-        f"- **{label}:** {text}"
-        for label, text in zip(outlook_labels, analysis.get("outlook", []))
-    ]
-    sections.append("### מבט לשבוע הבא\n" + "\n".join(outlook_lines))
+    sections.append(
+        "### מבט לשבוע הבא\n"
+        + build_plain_language_weekly_outlook(snapshot, fx_rates)
+    )
     return "\n\n".join(sections)
